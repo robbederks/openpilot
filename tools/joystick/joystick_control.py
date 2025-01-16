@@ -11,6 +11,8 @@ from openpilot.common.realtime import Ratekeeper
 from openpilot.system.hardware import HARDWARE
 from openpilot.tools.lib.kbhit import KBHit
 
+import openpilot.tools.joystick.xbox as xbox
+
 EXPO = 0.4
 
 
@@ -108,6 +110,33 @@ def send_thread(joystick):
 
     rk.keep_time()
 
+class XboxJoystick:
+  def __init__(self):
+    self.joy = xbox.Joystick()
+
+    self.accel_axis = 'ABS_RX'
+    self.steer_axis = 'ABS_Z'
+
+    self.axes_values = {self.accel_axis: 0., self.steer_axis: 0.}
+    self.axes_order = [self.accel_axis, self.steer_axis]
+
+  def update(self):
+
+    try:
+      self.axes_values[self.accel_axis] = self.joy.rightTrigger()
+      self.axes_values[self.steer_axis] = -1 * self.joy.leftStick()[0]
+    except Exception as e:
+      raise e
+      self.axes_values[self.accel_axis] = 0
+      self.axes_values[self.steer_axis] = 0
+
+    for a in [self.accel_axis, self.steer_axis]:
+      norm = self.axes_values[a]
+      norm = norm if abs(norm) > 0.03 else 0.
+      self.axes_values[a] = EXPO * norm ** 3 + (1 - EXPO) * norm
+
+    #print(f"steer {self.axes_values[self.steer_axis]} gas {self.axes_values[self.accel_axis]}")
+
 
 def joystick_control_thread(joystick):
   Params().put_bool('JoystickDebugMode', True)
@@ -130,7 +159,7 @@ if __name__ == '__main__':
 
   if not Params().get_bool("IsOffroad") and "ZMQ" not in os.environ:
     print("The car must be off before running joystick_control.")
-    exit()
+    #exit()
 
   print()
   if args.keyboard:
@@ -143,5 +172,5 @@ if __name__ == '__main__':
     print('Using joystick, make sure to run cereal/messaging/bridge on your device if running over the network!')
     print('If not running on a comma device, the mapping may need to be adjusted.')
 
-  joystick = Keyboard() if args.keyboard else Joystick()
+  joystick = Keyboard() if args.keyboard else XboxJoystick()
   joystick_control_thread(joystick)
