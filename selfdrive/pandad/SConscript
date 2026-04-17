@@ -1,10 +1,23 @@
-Import('env', 'arch', 'common', 'messaging')
+import os
+import libusb
 
-if arch != "Darwin":
-  libs = [common, messaging, 'pthread']
-  panda = env.Library('panda', ['panda.cc', 'spi.cc'])
+Import('env', 'common', 'messaging')
 
-  env.Program('pandad', ['main.cc', 'pandad.cc', 'panda_safety.cc'], LIBS=[panda] + libs)
+# Upstream pandad is SPI-only. The Model S setup uses an external panda over
+# USB, so we re-add USB comms (panda_comms.cc) and link libusb. Reference the
+# vendored libusb from the commaai/dependencies "libusb" package directly so it
+# satisfies the hermetic library resolver in the top-level SConstruct.
+libusb_root = os.path.join(os.path.dirname(libusb.__file__), "install")
+env = env.Clone()
+env.Append(
+  CPPPATH=[os.path.join(libusb_root, "include")],
+  LIBPATH=[os.path.join(libusb_root, "lib")],
+)
 
-  if GetOption('extras'):
-    env.Program('tests/test_pandad_canprotocol', ['tests/test_pandad_canprotocol.cc'], LIBS=[panda] + libs)
+libs = ['usb-1.0', common, messaging, 'pthread']
+panda = env.Library('panda', ['panda.cc', 'panda_comms.cc', 'spi.cc'])
+
+env.Program('pandad', ['main.cc', 'pandad.cc', 'panda_safety.cc'], LIBS=[panda] + libs)
+
+if GetOption('extras'):
+  env.Program('tests/test_pandad_usbprotocol', ['tests/test_pandad_usbprotocol.cc'], LIBS=[panda] + libs)
