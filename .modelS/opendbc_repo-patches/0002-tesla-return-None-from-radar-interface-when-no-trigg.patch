@@ -1,0 +1,33 @@
+From 805f111a915a0fdc747f01f59b177a9eb918dfa2 Mon Sep 17 00:00:00 2001
+From: Robbe Derks <robbe.derks@gmail.com>
+Date: Fri, 17 Apr 2026 12:36:38 +0200
+Subject: [PATCH 2/2] tesla: return None from radar interface when no trigger
+
+card.py only publishes liveTracks when update() returns a non-None
+RadarData. Returning an empty RadarData on every CAN tick caused
+liveTracks to be published at 100Hz with ~83% empty frames, making
+radar points appear to blink in downstream viewers.
+
+This restores the upstream behavior: only publish on radar cycles.
+---
+ opendbc/car/tesla/radar_interface.py | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/opendbc/car/tesla/radar_interface.py b/opendbc/car/tesla/radar_interface.py
+index 676a6ef2..503f7823 100644
+--- a/opendbc/car/tesla/radar_interface.py
++++ b/opendbc/car/tesla/radar_interface.py
+@@ -67,9 +67,8 @@ class RadarInterface(RadarInterfaceBase):
+     vls = self.rcp.update(can_strings)
+     self.updated_messages.update(vls)
+ 
+-    ret = structs.RadarData()
+     if self.trigger_msg not in self.updated_messages:
+-      return ret
++      return None
+ 
+     rr = self._update(self.updated_messages)
+     self.updated_messages.clear()
+-- 
+2.43.0
+
