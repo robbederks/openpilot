@@ -1,0 +1,60 @@
+name: Rebase Model S
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Override: upstream ref to rebase onto (e.g. pull/1234/head, release3-staging)'
+        required: false
+      output_slug:
+        description: 'Override: output branch will be modelS-<slug> (auto-derived if empty)'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rebase-modelS-${{ github.event.inputs.output_slug || github.event.inputs.upstream_ref || 'cron' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: modelS-source
+      - name: Generate matrix
+        id: gen
+        env:
+          DISPATCH_REF: ${{ inputs.upstream_ref }}
+          DISPATCH_SLUG: ${{ inputs.output_slug }}
+        run: bash .modelS/scripts/gen-matrix.sh
+
+  rebase:
+    needs: plan
+    if: ${{ needs.plan.outputs.matrix != '{"include":[]}' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: modelS-source
+          fetch-depth: 0
+          submodules: false
+          persist-credentials: true
+      - name: Configure git identity
+        run: |
+          git config --global user.name  "modelS-rebase-bot"
+          git config --global user.email "modelS-rebase-bot@users.noreply.github.com"
+      - name: Rebase onto ${{ matrix.upstream }}
+        env:
+          UPSTREAM_REPO: https://github.com/commaai/openpilot
+          UPSTREAM_REF:  ${{ matrix.upstream }}
+          OUTPUT_SLUG:   ${{ matrix.slug }}
+        run: bash .modelS/scripts/rebase.sh
