@@ -1,0 +1,3052 @@
+From a904539afbd0eece7bcaec60348e629615209cff Mon Sep 17 00:00:00 2001
+From: lukasloetkolben <61192133+lukasloetkolben@users.noreply.github.com>
+Date: Sat, 11 Apr 2026 11:43:54 +0200
+Subject: [PATCH 1/2] xnor-tech: Tesla legacy & MG support, external panda
+ integration
+
+- Add MG car support (carcontroller, carstate, fingerprints, safety mode)
+- Add Tesla legacy support (Model S/X HW1/HW2/HW3, Model Y Juniper)
+- Add tesla_legacy safety mode for older Tesla hardware
+- Add Tesla Raven party DBC, updated tesla_can DBC
+- Add legacy Tesla harness definitions
+- Update firmware fingerprints for Tesla Model S/X/Y variants
+---
+ .github/labeler.yaml                          |   4 +
+ opendbc/car/__init__.py                       |   2 +-
+ opendbc/car/car.capnp                         |   2 +
+ opendbc/car/docs_definitions.py               |   5 +
+ opendbc/car/mg/__init__.py                    |   0
+ opendbc/car/mg/carcontroller.py               |  38 ++
+ opendbc/car/mg/carstate.py                    |  79 ++++
+ opendbc/car/mg/fingerprints.py                |  29 ++
+ opendbc/car/mg/interface.py                   |  36 ++
+ opendbc/car/mg/mgcan.py                       |  29 ++
+ opendbc/car/mg/values.py                      |  80 ++++
+ opendbc/car/tesla/carcontroller.py            |  29 +-
+ opendbc/car/tesla/carstate.py                 | 130 +++++-
+ opendbc/car/tesla/fingerprints.py             |  43 ++
+ opendbc/car/tesla/interface.py                |  49 ++-
+ opendbc/car/tesla/radar_interface.py          |  70 +++-
+ opendbc/car/tesla/teslacan.py                 |  23 +-
+ opendbc/car/tesla/teslacan_legacy.py          |  65 +++
+ opendbc/car/tesla/values.py                   |  85 +++-
+ opendbc/car/tests/routes.py                   |   6 +
+ opendbc/car/tests/test_fw_fingerprint.py      |   3 +-
+ opendbc/car/torque_data/override.toml         |   8 +
+ opendbc/car/values.py                         |   3 +-
+ .../dbc/generator/tesla/tesla_radar_bosch.py  |   2 +-
+ opendbc/dbc/mg.dbc                            | 316 ++++++++++++++
+ opendbc/dbc/tesla_can.dbc                     |  34 +-
+ opendbc/dbc/tesla_raven_party.dbc             | 115 ++++++
+ opendbc/safety/declarations.h                 |   2 +
+ opendbc/safety/modes/mg.h                     |  98 +++++
+ opendbc/safety/modes/tesla_legacy.h           | 291 +++++++++++++
+ opendbc/safety/safety.h                       |   4 +
+ opendbc/safety/tests/test_mg.py               |  68 +++
+ opendbc/safety/tests/test_tesla_hw1.py        | 312 ++++++++++++++
+ opendbc/safety/tests/test_tesla_hw23.py       | 391 ++++++++++++++++++
+ 34 files changed, 2413 insertions(+), 38 deletions(-)
+ create mode 100644 opendbc/car/mg/__init__.py
+ create mode 100644 opendbc/car/mg/carcontroller.py
+ create mode 100644 opendbc/car/mg/carstate.py
+ create mode 100644 opendbc/car/mg/fingerprints.py
+ create mode 100644 opendbc/car/mg/interface.py
+ create mode 100644 opendbc/car/mg/mgcan.py
+ create mode 100644 opendbc/car/mg/values.py
+ create mode 100644 opendbc/car/tesla/teslacan_legacy.py
+ create mode 100644 opendbc/dbc/mg.dbc
+ create mode 100644 opendbc/dbc/tesla_raven_party.dbc
+ create mode 100644 opendbc/safety/modes/mg.h
+ create mode 100644 opendbc/safety/modes/tesla_legacy.h
+ create mode 100755 opendbc/safety/tests/test_mg.py
+ create mode 100755 opendbc/safety/tests/test_tesla_hw1.py
+ create mode 100755 opendbc/safety/tests/test_tesla_hw23.py
+
+diff --git a/.github/labeler.yaml b/.github/labeler.yaml
+index 520e2d12..0d6ad3d8 100644
+--- a/.github/labeler.yaml
++++ b/.github/labeler.yaml
+@@ -55,6 +55,10 @@ rivian:
+   - changed-files:
+     - any-glob-to-any-file: 'opendbc/car/rivian/**'
+ 
++mg:
++  - changed-files:
++    - any-glob-to-any-file: 'opendbc/car/mg/**'
++
+ subaru:
+   - changed-files:
+     - any-glob-to-any-file: 'opendbc/car/subaru/**'
+diff --git a/opendbc/car/__init__.py b/opendbc/car/__init__.py
+index 376b27c3..916714ec 100644
+--- a/opendbc/car/__init__.py
++++ b/opendbc/car/__init__.py
+@@ -90,7 +90,7 @@ class Bus(StrEnum):
+   main = auto()
+   party = auto()
+   ap_party = auto()
+-
++  ap_pt = auto()
+ 
+ def rate_limit(new_value, last_value, dw_step, up_step):
+   return float(np.clip(new_value, last_value + dw_step, last_value + up_step))
+diff --git a/opendbc/car/car.capnp b/opendbc/car/car.capnp
+index d2b8d758..794db40c 100644
+--- a/opendbc/car/car.capnp
++++ b/opendbc/car/car.capnp
+@@ -635,6 +635,8 @@ struct CarParams {
+     fcaGiorgio @32;
+     rivian @33;
+     volkswagenMeb @34;
++    mg @35;
++    teslaLegacy @36;
+   }
+ 
+   enum SteerControlType {
+diff --git a/opendbc/car/docs_definitions.py b/opendbc/car/docs_definitions.py
+index 75edf795..d36963e6 100644
+--- a/opendbc/car/docs_definitions.py
++++ b/opendbc/car/docs_definitions.py
+@@ -134,6 +134,7 @@ class CarHarness(EnumBase):
+   obd_ii = BaseCarHarness("OBD-II connector", parts=[Cable.long_obdc_cable], has_connector=False)
+   gm = BaseCarHarness("GM connector", parts=[Accessory.harness_box])
+   gmsdgm = BaseCarHarness("GM SDGM connector", parts=[Accessory.harness_box, Accessory.comma_power, Cable.long_obdc_cable])
++  mg_a = BaseCarHarness("MG A connector")
+   nissan_a = BaseCarHarness("Nissan A connector", parts=[Accessory.harness_box, Accessory.comma_power, Cable.long_obdc_cable])
+   nissan_b = BaseCarHarness("Nissan B connector", parts=[Accessory.harness_box, Accessory.comma_power, Cable.long_obdc_cable])
+   mazda = BaseCarHarness("Mazda connector")
+@@ -143,6 +144,10 @@ class CarHarness(EnumBase):
+   rivian_b = BaseCarHarness("Rivian B connector", parts=[Accessory.harness_box, Accessory.comma_power, Cable.long_obdc_cable])
+   tesla_a = BaseCarHarness("Tesla A connector", parts=[Accessory.harness_box, Cable.long_obdc_cable])
+   tesla_b = BaseCarHarness("Tesla B connector", parts=[Accessory.harness_box, Cable.long_obdc_cable])
++  tesla_model_s_hw1 = BaseCarHarness("Tesla Model S HW1 connector", parts=[Accessory.harness_box, Cable.long_obdc_cable])
++  tesla_model_x_hw1 = BaseCarHarness("Tesla Model X HW1 connector", parts=[Accessory.harness_box, Cable.long_obdc_cable])
++  tesla_model_sx_hw2 = BaseCarHarness("Tesla Model S/X HW2 connector", parts=[Accessory.harness_box, Cable.long_obdc_cable])
++  tesla_model_sx_hw3 = BaseCarHarness("Tesla Model S/X HW3 connector", parts=[Accessory.harness_box, Cable.long_obdc_cable])
+   psa_a = BaseCarHarness("PSA A connector", parts=[Accessory.harness_box, Cable.long_obdc_cable])
+ 
+ 
+diff --git a/opendbc/car/mg/__init__.py b/opendbc/car/mg/__init__.py
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/opendbc/car/mg/carcontroller.py b/opendbc/car/mg/carcontroller.py
+new file mode 100644
+index 00000000..30512519
+--- /dev/null
++++ b/opendbc/car/mg/carcontroller.py
+@@ -0,0 +1,38 @@
++from opendbc.can.packer import CANPacker
++from opendbc.car import Bus
++from opendbc.car.lateral import apply_driver_steer_torque_limits
++from opendbc.car.interfaces import CarControllerBase
++from opendbc.car.mg.mgcan import create_lka_steering
++from opendbc.car.mg.values import CarControllerParams
++
++
++class CarController(CarControllerBase):
++  def __init__(self, dbc_names, CP):
++    super().__init__(dbc_names, CP)
++    self.packer = CANPacker(dbc_names[Bus.pt])
++
++    self.apply_torque_last = 0
++
++  def update(self, CC, CS, now_nanos):
++    actuators = CC.actuators
++
++    can_sends = []
++
++    # steering command
++    if self.frame % CarControllerParams.STEER_STEP == 0:
++      if CC.latActive:
++        # calculate steer and also set limits due to driver torque
++        new_torque = int(round(actuators.torque * CarControllerParams.STEER_MAX))
++        apply_torque = apply_driver_steer_torque_limits(new_torque, self.apply_torque_last, CS.out.steeringTorque, CarControllerParams)
++      else:
++        apply_torque = 0
++
++      self.apply_torque_last = apply_torque
++      can_sends.append(create_lka_steering(self.packer, (self.frame // CarControllerParams.STEER_STEP) % 16, apply_torque, CC.latActive))
++
++    new_actuators = actuators.as_builder()
++    new_actuators.torque = self.apply_torque_last / CarControllerParams.STEER_MAX
++    new_actuators.torqueOutputCan = self.apply_torque_last
++
++    self.frame += 1
++    return new_actuators, can_sends
+diff --git a/opendbc/car/mg/carstate.py b/opendbc/car/mg/carstate.py
+new file mode 100644
+index 00000000..52692555
+--- /dev/null
++++ b/opendbc/car/mg/carstate.py
+@@ -0,0 +1,79 @@
++from opendbc.can.parser import CANParser
++from opendbc.car import Bus, structs
++from opendbc.car.interfaces import CarStateBase
++from opendbc.car.mg.values import CAR, DBC, GEAR_MAP
++from opendbc.car.common.conversions import Conversions as CV
++
++GearShifter = structs.CarState.GearShifter
++
++
++class CarState(CarStateBase):
++  def __init__(self, CP):
++    super().__init__(CP)
++
++  def update(self, can_parsers) -> structs.CarState:
++    cp = can_parsers[Bus.pt]
++    cp_cam = can_parsers[Bus.cam]
++    ret = structs.CarState()
++
++    # Vehicle speed
++    ret.vEgoRaw = cp.vl["SCS_HSC2_FrP19"]["VehSpdAvgHSC2"] * CV.KPH_TO_MS
++    ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
++    ret.standstill = cp.vl["SCS_HSC2_FrP24"]["VehSdslStsHSC2"] == 1
++
++    # Gas pedal
++    ret.gasPressed = cp.vl["GW_HSC2_HCU_FrP00"]["EPTAccelActuPosHSC2"] > 0
++
++    # Brake pedal
++    ret.brake = 0
++    if self.CP.carFingerprint == CAR.MG_ZS_EV:
++      ret.brakePressed = cp.vl["GW_HSC2_HCU_FrP00"]["EPTBrkPdlDscrtInptStsHSC2"] == 1
++    else:
++      ret.brakePressed = cp.vl["EHBS_HSC2_FrP00"]["BrkPdlAppdHSC2"] == 1
++
++    # Steering wheel
++    ret.steeringAngleDeg = cp.vl["SAS_HSC2_FrP00"]["StrgWhlAngHSC2"]
++    ret.steeringRateDeg = cp.vl["SAS_HSC2_FrP00"]["StrgWhlAngGrdHSC2"]
++    ret.steeringTorque = cp.vl["EPS_HSC2_FrP03"]["DrvrStrgDlvrdToqHSC2"]
++    ret.steeringTorqueEps = cp.vl["EPS_HSC2_FrP03"]["ChLKARespToqHSC2"]
++    ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > 1.0, 5)
++
++    ret.steerFaultTemporary = cp_cam.vl["FVCM_HSC2_FrP02"]["LDWSysFltStsHSC2"] != 0  # TODO: validate
++
++    # Cruise state
++    ret.cruiseState.enabled = cp.vl["RADAR_HSC2_FrP00"]["ACCSysSts_RadarHSC2"] in (2, 3)  # Active, Override
++    ret.cruiseState.available = True
++    ret.cruiseState.standstill = False  # TODO
++    ret.cruiseState.speed = cp.vl["RADAR_HSC2_FrP02"]["ACCDrvrSelTrgtSpd_RadarHSC2"] * CV.KPH_TO_MS
++
++    ret.accFaulted = cp_cam.vl["FVCM_HSC2_FrP02"]["TJAICASysFltStsHSC2"] != 0  # TODO: validate
++
++    # Gear
++    ret.gearShifter = GEAR_MAP.get(int(cp.vl["GW_HSC2_ECM_FrP04"]["TrEstdGearHSC2"]), GearShifter.unknown)
++
++    # Doors
++    ret.doorOpen = False  # TODO
++
++    # Blinkers
++    ret.leftBlinker = cp.vl["GW_HSC2_BCM_FrP04"]["DircnIndLampSwStsHSC2"] == 1
++    ret.rightBlinker = cp.vl["GW_HSC2_BCM_FrP04"]["DircnIndLampSwStsHSC2"] == 2
++
++    # Seatbelt
++    ret.seatbeltUnlatched = cp.vl["GW_HSC2_SDM_FrP00"]["DrvrSbltAtcHSC2"] != 1
++
++    # Blindspot
++    # ret.leftBlindspot = False
++    # ret.rightBlindspot = False
++
++    # AEB
++    ret.stockAeb = False
++
++    return ret
++
++  @staticmethod
++  def get_can_parsers(CP):
++    return {
++      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 0),
++      Bus.radar: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 1),
++      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 2),
++    }
+diff --git a/opendbc/car/mg/fingerprints.py b/opendbc/car/mg/fingerprints.py
+new file mode 100644
+index 00000000..ea5ddcf0
+--- /dev/null
++++ b/opendbc/car/mg/fingerprints.py
+@@ -0,0 +1,29 @@
++from opendbc.car.structs import CarParams
++from opendbc.car.mg.values import CAR
++
++Ecu = CarParams.Ecu
++
++FW_VERSIONS = {
++  CAR.MG_5_EV: {
++    (Ecu.eps, 0x721, None): [
++      b'\x10gs\x16\x01',
++    ],
++    (Ecu.fwdCamera, 0x733, None): [
++      b'\x10y\x00 \x01',
++    ],
++    (Ecu.fwdRadar, 0x734, None): [
++      b'\x10y\x000\x01',
++    ],
++  },
++  CAR.MG_ZS_EV: {
++    (Ecu.eps, 0x721, None): [
++      b'\x11\x06c\x94\x01',
++    ],
++    (Ecu.fwdCamera, 0x733, None): [
++      b'\x11\x03\t!\x01',
++    ],
++    (Ecu.fwdRadar, 0x734, None): [
++      b'\x11\x03\t\x18\x01',
++    ],
++  },
++}
+diff --git a/opendbc/car/mg/interface.py b/opendbc/car/mg/interface.py
+new file mode 100644
+index 00000000..0d2d6b84
+--- /dev/null
++++ b/opendbc/car/mg/interface.py
+@@ -0,0 +1,36 @@
++from opendbc.car import get_safety_config, structs
++from opendbc.car.interfaces import CarInterfaceBase
++from opendbc.car.mg.carcontroller import CarController
++from opendbc.car.mg.carstate import CarState
++from opendbc.car.mg.values import CAR, MgSafetyFlags
++
++
++class CarInterface(CarInterfaceBase):
++  CarState = CarState
++  CarController = CarController
++
++  @staticmethod
++  def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
++    ret.brand = "mg"
++
++    ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.mg)]
++
++    if candidate == CAR.MG_ZS_EV:
++      ret.safetyConfigs[0].safetyParam |= MgSafetyFlags.ALT_BRAKE.value
++
++    ret.steerActuatorDelay = 0.3
++    CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
++
++    ret.steerControlType = structs.CarParams.SteerControlType.torque
++    ret.radarUnavailable = True
++
++    ret.alphaLongitudinalAvailable = False
++    if alpha_long:
++      ret.openpilotLongitudinalControl = True
++      ret.safetyConfigs[0].safetyParam |= MgSafetyFlags.LONG_CONTROL.value
++
++    ret.longitudinalActuatorDelay = 0.35
++    ret.vEgoStopping = 0.25
++    ret.stopAccel = 0
++
++    return ret
+diff --git a/opendbc/car/mg/mgcan.py b/opendbc/car/mg/mgcan.py
+new file mode 100644
+index 00000000..18894d3c
+--- /dev/null
++++ b/opendbc/car/mg/mgcan.py
+@@ -0,0 +1,29 @@
++def calc_checksum(values):
++  lka_req_toq = values['LKAReqToqHSC2'] + 1024
++  lka_req_toq_sts = values['LKAReqToqStsHSC2']
++  lka_req_toq_v = values['LKAReqToqVHSC2']
++  lka_alv_rc = values['LKAAlvRCHSC2']
++
++  combined = ((lka_req_toq << 1) | (lka_req_toq_sts << 12) | lka_req_toq_v) & 0x3FFF
++  with_counter = (combined + lka_alv_rc) & 0x3FFF
++  checksum = ((~with_counter) + 1) & 0x3FFF
++
++  return checksum
++
++
++def create_lka_steering(packer, counter, apply_torque, active):
++
++  values = {
++    "LKAReqToqHSC2": apply_torque,
++    "LKAReqToqVHSC2": 0,
++    "LKAAlvRCHSC2": counter,
++    "LDWLKAVbnLvlReqHSC2": 0,  # TODO: vibration level?
++    "LKASysStsHSC2": 0,
++    "LKAReqToqStsHSC2": active,
++    "LKASysFltStsHSC2": 0,
++    "LKADrvrTkovReqHSC2": 0,
++    "LKAReqToqPVHSC2": 0
++  }
++
++  values["LKAReqToqPVHSC2"] = calc_checksum(values)
++  return packer.make_can_msg("FVCM_HSC2_FrP03", 0, values)
+diff --git a/opendbc/car/mg/values.py b/opendbc/car/mg/values.py
+new file mode 100644
+index 00000000..0ac3f8ae
+--- /dev/null
++++ b/opendbc/car/mg/values.py
+@@ -0,0 +1,80 @@
++from dataclasses import dataclass, field
++from enum import IntFlag
++
++from opendbc.car import Bus, CarSpecs, DbcDict, PlatformConfig, Platforms, structs, uds
++from opendbc.car.docs_definitions import CarHarness, CarDocs, CarParts
++from opendbc.car.fw_query_definitions import FwQueryConfig, Request, StdQueries, p16
++
++
++@dataclass
++class MgCarDocs(CarDocs):
++  package: str = "All"
++  car_parts: CarParts = field(default_factory=CarParts.common([CarHarness.mg_a]))
++
++
++@dataclass
++class MgPlatformConfig(PlatformConfig):
++  dbc_dict: DbcDict = field(default_factory=lambda: {Bus.pt: 'mg', Bus.radar: 'mg'})
++
++
++class CAR(Platforms):
++  MG_5_EV = MgPlatformConfig(
++    [
++      MgCarDocs("MG 5 EV 2021-24"),
++    ],
++    CarSpecs(mass=1640., wheelbase=2.66, steerRatio=15.8),
++  )
++
++  MG_ZS_EV = MgPlatformConfig(
++    [
++      MgCarDocs("MG ZS EV 2022"),
++    ],
++    CarSpecs(mass=1590., wheelbase=2.58, steerRatio=15.8),
++  )
++
++
++MG_VERSION_REQUEST = bytes([uds.SERVICE_TYPE.READ_DATA_BY_IDENTIFIER]) + \
++  p16(0xf1a0)
++MG_VERSION_RESPONSE = bytes([uds.SERVICE_TYPE.READ_DATA_BY_IDENTIFIER + 0x40])
++
++FW_QUERY_CONFIG = FwQueryConfig(
++  requests=[
++    Request(
++      [StdQueries.TESTER_PRESENT_REQUEST, StdQueries.MANUFACTURER_ECU_HARDWARE_NUMBER_REQUEST],
++      [StdQueries.TESTER_PRESENT_RESPONSE, StdQueries.MANUFACTURER_ECU_HARDWARE_NUMBER_RESPONSE],
++      bus=1,
++    ),
++  ],
++)
++
++GEAR_MAP = {
++  0: structs.CarState.GearShifter.unknown,
++  15: structs.CarState.GearShifter.park,
++  14: structs.CarState.GearShifter.reverse,
++  13: structs.CarState.GearShifter.neutral,
++  **{i: structs.CarState.GearShifter.drive for i in range(1, 9)},
++}
++
++
++class CarControllerParams:
++  STEER_STEP = 2  # FVCM_HSC2_FrP03 message frequency 50Hz
++  STEER_MAX = 300
++  STEER_DELTA_UP = 10      # torque increase per refresh
++  STEER_DELTA_DOWN = 15    # torque decrease per refresh
++  STEER_DRIVER_ALLOWANCE = 100  # allowed driver torque before start limiting
++  STEER_DRIVER_MULTIPLIER = 2  # weight driver torque
++  STEER_DRIVER_FACTOR = 100
++
++  ACCEL_MIN = -3.5  # m/s^2
++  ACCEL_MAX = 2.0  # m/s^2
++
++  def __init__(self, CP):
++    pass
++
++
++class MgSafetyFlags(IntFlag):
++  LONG_CONTROL = 1
++  ALT_BRAKE = 2
++
++
++DBC = CAR.create_dbc_map()
+diff --git a/opendbc/car/tesla/carcontroller.py b/opendbc/car/tesla/carcontroller.py
+index 8b7d9989..b4d0489c 100644
+--- a/opendbc/car/tesla/carcontroller.py
++++ b/opendbc/car/tesla/carcontroller.py
+@@ -4,7 +4,8 @@ from opendbc.car import Bus
+ from opendbc.car.lateral import apply_steer_angle_limits_vm
+ from opendbc.car.interfaces import CarControllerBase
+ from opendbc.car.tesla.teslacan import TeslaCAN
+-from opendbc.car.tesla.values import CarControllerParams
++from opendbc.car.tesla.teslacan_legacy import TeslaCANRaven
++from opendbc.car.tesla.values import CarControllerParams, CANBUS, LEGACY_CARS, CAR
+ from opendbc.car.vehicle_model import VehicleModel
+ 
+ 
+@@ -25,6 +26,16 @@ class CarController(CarControllerBase):
+     # Vehicle model used for lateral limiting
+     self.VM = VehicleModel(get_safety_CP())
+ 
++    if CP.carFingerprint in LEGACY_CARS:
++      if CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1,):
++        CANBUS.powertrain = CANBUS.party
++        CANBUS.autopilot_powertrain = CANBUS.autopilot_party
++
++      self.packers = {CANBUS.party: CANPacker(dbc_names[Bus.party]), CANBUS.powertrain: CANPacker(dbc_names[Bus.pt])}
++      self.tesla_can = TeslaCANRaven(self.packers)
++      from opendbc.car.tesla.interface import CarInterface
++      self.VM = VehicleModel(CarInterface.get_non_essential_params("TESLA_MODEL_S_HW3"))
++
+   def update(self, CC, CS, now_nanos):
+     actuators = CC.actuators
+     can_sends = []
+@@ -38,11 +49,15 @@ class CarController(CarControllerBase):
+       # Angular rate limit based on speed
+       self.apply_angle_last = apply_steer_angle_limits_vm(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw, CS.out.steeringAngleDeg,
+                                                           lat_active, CarControllerParams, self.VM)
++      if self.CP.carFingerprint in LEGACY_CARS:
++        cntr = (self.frame // 2) % 16
++        can_sends.append(self.tesla_can.create_steering_control(cntr, self.apply_angle_last, lat_active))
++      else:
++        can_sends.append(self.tesla_can.create_steering_control(self.apply_angle_last, lat_active))
+ 
+-      can_sends.append(self.tesla_can.create_steering_control(self.apply_angle_last, lat_active))
+-
+-    if self.frame % 10 == 0:
+-      can_sends.append(self.tesla_can.create_steering_allowed())
++    if self.frame % 10 == 0 and self.CP.carFingerprint not in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1, ):
++      cntr = (self.frame // 10) % 16
++      can_sends.append(self.tesla_can.create_steering_allowed(cntr))
+ 
+     # Longitudinal control
+     if self.CP.openpilotLongitudinalControl:
+@@ -50,13 +65,13 @@ class CarController(CarControllerBase):
+         state = 13 if CC.cruiseControl.cancel else 4  # 4=ACC_ON, 13=ACC_CANCEL_GENERIC_SILENT
+         accel = float(np.clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX))
+         cntr = (self.frame // 4) % 8
+-        can_sends.append(self.tesla_can.create_longitudinal_command(state, accel, cntr, CS.out.vEgo, CC.longActive))
++        can_sends.append(self.tesla_can.create_longitudinal_command(state, accel, cntr, CS.out.vEgo, CC.longActive, CS.out.gasPressed))
+ 
+     else:
+       # Increment counter so cancel is prioritized even without openpilot longitudinal
+       if CC.cruiseControl.cancel:
+         cntr = (CS.das_control["DAS_controlCounter"] + 1) % 8
+-        can_sends.append(self.tesla_can.create_longitudinal_command(13, 0, cntr, CS.out.vEgo, False))
++        can_sends.append(self.tesla_can.create_longitudinal_command(13, 0, cntr, CS.out.vEgo, False, CS.out.gasPressed))
+ 
+     # TODO: HUD control
+     new_actuators = actuators.as_builder()
+diff --git a/opendbc/car/tesla/carstate.py b/opendbc/car/tesla/carstate.py
+index 86308978..e361467d 100644
+--- a/opendbc/car/tesla/carstate.py
++++ b/opendbc/car/tesla/carstate.py
+@@ -5,7 +5,7 @@ from opendbc.car.carlog import carlog
+ from opendbc.car.common.conversions import Conversions as CV
+ from opendbc.car.interfaces import CarStateBase
+ from opendbc.car.tesla.teslacan import get_steer_ctrl_type
+-from opendbc.car.tesla.values import DBC, CANBUS, GEAR_MAP, STEER_THRESHOLD, TeslaFlags
++from opendbc.car.tesla.values import DBC, CANBUS, GEAR_MAP, STEER_THRESHOLD, TeslaFlags, TeslaLegacyParams, CAR, LEGACY_CARS
+ 
+ ButtonType = structs.CarState.ButtonEvent.Type
+ 
+@@ -14,7 +14,26 @@ class CarState(CarStateBase):
+   def __init__(self, CP):
+     super().__init__(CP)
+     self.can_define = CANDefine(DBC[CP.carFingerprint][Bus.party])
+-    self.shifter_values = self.can_define.dv["DI_systemStatus"]["DI_gear"]
++
++    if self.CP.carFingerprint in LEGACY_CARS:
++      if self.CP.carFingerprint == CAR.TESLA_MODEL_S_HW3:
++        CANBUS.chassis = 1
++        CANBUS.radar = 5
++      elif self.CP.carFingerprint in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1, ):
++        CANBUS.powertrain = CANBUS.party
++        CANBUS.autopilot_powertrain = CANBUS.autopilot_party
++
++      self.can_define_party = CANDefine(DBC[CP.carFingerprint][Bus.party])
++      self.can_define_pt = CANDefine(DBC[CP.carFingerprint][Bus.pt])
++      self.can_define_chassis = CANDefine(DBC[CP.carFingerprint][Bus.chassis])
++      self.can_defines = {
++        **self.can_define_party.dv,
++        **self.can_define_pt.dv,
++        **self.can_define_chassis.dv,
++      }
++      self.shifter_values = self.can_defines["DI_torque2"]["DI_gear"]
++    else:
++      self.shifter_values = self.can_define.dv["DI_systemStatus"]["DI_gear"]
+ 
+     self.autopark = False
+     self.autopark_prev = False
+@@ -35,6 +54,9 @@ class CarState(CarStateBase):
+     self.cruise_enabled_prev = cruise_enabled
+ 
+   def update(self, can_parsers) -> structs.CarState:
++    if self.CP.carFingerprint in LEGACY_CARS:
++      return self.update_legacy(can_parsers)
++
+     cp_party = can_parsers[Bus.party]
+     cp_ap_party = can_parsers[Bus.ap_party]
+     ret = structs.CarState()
+@@ -140,8 +162,112 @@ class CarState(CarStateBase):
+ 
+     return ret
+ 
++  def update_legacy(self, can_parsers) -> structs.CarState:
++    cp_party = can_parsers[Bus.party]
++    cp_ap_party = can_parsers[Bus.ap_party]
++    cp_pt = can_parsers[Bus.pt]
++    cp_ap_pt = can_parsers[Bus.ap_pt]
++    cp_chassis = can_parsers[Bus.chassis]
++    ret = structs.CarState()
++
++    # Vehicle speed
++    ret.vEgoRaw = cp_chassis.vl["ESP_B"]["ESP_vehicleSpeed"] * CV.KPH_TO_MS
++    ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
++
++    # Gas pedal
++    ret.gasPressed = cp_pt.vl["DI_torque1"]["DI_pedalPos"] > 0
++
++    # Brake pedal
++    ret.brake = 0
++    ret.brakePressed = cp_chassis.vl["BrakeMessage"]["driverBrakeStatus"] == 2
++
++    # Steering wheel
++    if self.CP.carFingerprint == CAR.TESLA_MODEL_S_HW3:
++      epas_status = cp_party.vl["EPAS_sysStatus"]
++    else:
++      epas_status = cp_chassis.vl["EPAS_sysStatus"]
++    self.hands_on_level = epas_status["EPAS_handsOnLevel"]
++    ret.steeringAngleDeg = -epas_status["EPAS_internalSAS"]
++    ret.steeringRateDeg = -cp_chassis.vl["STW_ANGLHP_STAT"]["StW_AnglHP_Spd"]
++    ret.steeringTorque = -epas_status["EPAS_torsionBarTorque"]
++
++    # stock handsOnLevel uses >0.5 for 0.25s, but is too slow
++    ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > STEER_THRESHOLD, 5)
++
++    eac_status = self.can_defines["EPAS_sysStatus"]["EPAS_eacStatus"].get(int(epas_status["EPAS_eacStatus"]), None)
++    ret.steerFaultPermanent = eac_status == "EAC_FAULT"
++    ret.steerFaultTemporary = eac_status == "EAC_INHIBITED"
++
++    # FSD disengages using union of handsOnLevel (slow overrides) and high angle rate faults (fast overrides, high speed)
++    eac_error_code = self.can_defines["EPAS_sysStatus"]["EPAS_eacErrorCode"].get(int(epas_status["EPAS_eacErrorCode"]), None)
++    ret.steeringDisengage = self.hands_on_level >= 3 or (eac_status == "EAC_INHIBITED" and
++                                                         eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
++
++    # Cruise state
++    cruise_state = self.can_defines["DI_state"]["DI_cruiseState"].get(int(cp_chassis.vl["DI_state"]["DI_cruiseState"]), None)
++    speed_units = self.can_defines["DI_state"]["DI_speedUnits"].get(int(cp_chassis.vl["DI_state"]["DI_speedUnits"]), None)
++
++    cruise_enabled = cruise_state in ("ENABLED", "STANDSTILL", "OVERRIDE", "PRE_FAULT", "PRE_CANCEL")
++
++    # Match panda safety cruise engaged logic
++    ret.cruiseState.enabled = cruise_enabled
++    if speed_units == "KPH":
++      ret.cruiseState.speed = max(cp_chassis.vl["DI_state"]["DI_digitalSpeed"] * CV.KPH_TO_MS, 1e-3)
++    elif speed_units == "MPH":
++      ret.cruiseState.speed = max(cp_chassis.vl["DI_state"]["DI_digitalSpeed"] * CV.MPH_TO_MS, 1e-3)
++    ret.cruiseState.available = cruise_state == "STANDBY" or ret.cruiseState.enabled
++    ret.cruiseState.standstill = False  # This needs to be false, since we can resume from stop without sending anything special
++    ret.standstill = cruise_state == "STANDSTILL"
++    ret.accFaulted = cruise_state == "FAULT"
++
++    # Gear
++    ret.gearShifter = GEAR_MAP[self.can_defines["DI_torque2"]["DI_gear"].get(int(cp_chassis.vl["DI_torque2"]["DI_gear"]), "DI_GEAR_INVALID")]
++
++    # Doors
++    DOORS = ["DOOR_STATE_FL", "DOOR_STATE_FR", "DOOR_STATE_RL", "DOOR_STATE_RR", "DOOR_STATE_FrontTrunk", "BOOT_STATE"]
++    ret.doorOpen = any((self.can_defines["GTW_carState"][door].get(int(cp_chassis.vl["GTW_carState"][door]), "OPEN") == "OPEN") for door in DOORS)
++
++    # Blinkers
++    if self.CP.carFingerprint == CAR.TESLA_MODEL_X_HW1:
++      ret.leftBlinker = cp_chassis.vl["STW_ACTN_RQ"]["TurnIndLvr_Stat"] == 1
++      ret.rightBlinker = cp_chassis.vl["STW_ACTN_RQ"]["TurnIndLvr_Stat"] == 2
++    else:
++      ret.leftBlinker = cp_chassis.vl["GTW_carState"]["BC_indicatorLStatus"] == 1
++      ret.rightBlinker = cp_chassis.vl["GTW_carState"]["BC_indicatorRStatus"] == 1
++
++    # Seatbelt
++    if self.CP.flags & TeslaLegacyParams.NO_SDM1:
++      ret.seatbeltUnlatched = cp_chassis.vl["RCM_status"]["RCM_buckleDriverStatus"] != 1
++    else:
++      ret.seatbeltUnlatched = cp_chassis.vl["SDM1"]["SDM_bcklDrivStatus"] != 1
++
++    # AEB
++    ret.stockAeb = cp_ap_pt.vl["DAS_control"]["DAS_aebEvent"] == 1
++
++    # LKAS
++    ret.stockLkas = cp_ap_party.vl["DAS_steeringControl"]["DAS_steeringControlType"] == 2  # LANE_KEEP_ASSIST
++
++    # Stock Autosteer should be off (includes FSD)
++    # ret.invalidLkasSetting = cp_ap_party.vl["DAS_settings"]["DAS_autosteerEnabled"] != 0
++
++    # Buttons # ToDo: add Gap adjust button
++
++    # Messages needed by carcontroller
++    self.das_control = copy.copy(cp_ap_pt.vl["DAS_control"])
++
++    return ret
++
+   @staticmethod
+   def get_can_parsers(CP):
++    if CP.carFingerprint in LEGACY_CARS:
++      return {
++        Bus.party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.party),
++        Bus.ap_party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.autopilot_party),
++        Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CANBUS.powertrain),
++        Bus.ap_pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CANBUS.autopilot_powertrain),
++        Bus.chassis: CANParser(DBC[CP.carFingerprint][Bus.chassis], [], CANBUS.chassis if CP.carFingerprint == CAR.TESLA_MODEL_S_HW3 else CANBUS.party),
++      }
++
+     return {
+       Bus.party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.party),
+       Bus.ap_party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.autopilot_party)
+diff --git a/opendbc/car/tesla/fingerprints.py b/opendbc/car/tesla/fingerprints.py
+index 9b33fd00..b2dabd6d 100644
+--- a/opendbc/car/tesla/fingerprints.py
++++ b/opendbc/car/tesla/fingerprints.py
+@@ -42,12 +42,55 @@ FW_VERSIONS = {
+       b'TeMYG4_Main_0.0.0 (78),Y4003.06.0',
+       b'TeMYG4_SingleECU_0.0.0 (28),Y4S002.23.0',
+       b'TeMYG4_SingleECU_0.0.0 (33),Y4S002.26',
++      b'TeMYG4_Main_0.0.0 (67),Y4OC003.04.3',
++      b'TeMYG4_Main_0.0.0 (77),Y4OC003.06.5',
++      b'TeMYG4_Main_0.0.0 (78),Y4OC003.07.0',
++      b'\x01\x0113\x04\x00\x01\x00\x00\x00\t\x00\x00\x00\x01\x00\x00\xff\xff',
++      b'\x01\x0113\x04\x00\x01\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\xff\xff',
+     ],
+   },
+   CAR.TESLA_MODEL_X: {
+     (Ecu.eps, 0x730, None): [
+       b'TeM3_SP_XP002p2_0.0.0 (23),XPR003.6.0',
+       b'TeM3_SP_XP002p2_0.0.0 (36),XPR003.10.0',
++      b'TeM3_SP_XP002p2_0.0.0 (34),XP003.9.2',
++      b'TeM3_SP_XP002p2_0.0.0 (36),XP003.10.0',
++      b'TeM3_SP_XP002p2_0.0.0 (23),XP003.6.0',
++    ],
++  },
++  CAR.TESLA_MODEL_X_HW1: {
++    (Ecu.eps, 0x730, None): [
++      b'1057658-00-00B\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++    ],
++  },
++  CAR.TESLA_MODEL_X_HW2: {
++    (Ecu.eps, 0x730, None): [
++      b'\x10#\x81',
++    ],
++  },
++  CAR.TESLA_MODEL_S: {
++    (Ecu.eps, 0x730, None): [
++      b'TeM3_SP_XP002p2_0.0.0 (23),SPP003.6.0',
++      b'TeM3_SP_XP002p2_0.0.0 (23),SPR003.6.0',
++      b'TeM3_SP_XP002p2_0.0.0 (34),SPP003.9.2',
++      b'TeM3_SP_XP002p2_0.0.0 (36),SPP003.10.0',
++    ],
++  },
++  CAR.TESLA_MODEL_S_HW1: {
++    (Ecu.eps, 0x730, None): [
++      b'1016704-00-HAA\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00',
++      b'\x10\x00A',
++    ],
++  },
++  CAR.TESLA_MODEL_S_HW2: {
++    (Ecu.eps, 0x730, None): [
++      b'\x10#\x01',
++    ],
++  },
++  CAR.TESLA_MODEL_S_HW3: {
++    (Ecu.eps, 0x730, None): [
++      b'SX_0.0.0 (99),S013.7',
++      b'SX_0.0.0 (99),SR013.7',
+     ],
+   },
+ }
+diff --git a/opendbc/car/tesla/interface.py b/opendbc/car/tesla/interface.py
+index c43baad0..8c4394db 100644
+--- a/opendbc/car/tesla/interface.py
++++ b/opendbc/car/tesla/interface.py
+@@ -2,8 +2,9 @@ from opendbc.car import Bus, get_safety_config, structs
+ from opendbc.car.interfaces import CarInterfaceBase
+ from opendbc.car.tesla.carcontroller import CarController
+ from opendbc.car.tesla.carstate import CarState
+-from opendbc.car.tesla.values import TeslaSafetyFlags, TeslaFlags, CANBUS, CAR, DBC, FSD_14_FW, Ecu
++from opendbc.car.tesla.values import TeslaSafetyFlags, TeslaFlags, CANBUS, CAR, DBC, FSD_14_FW, Ecu, TeslaLegacyParams, LEGACY_CARS
+ from opendbc.car.tesla.radar_interface import RadarInterface, RADAR_START_ADDR
++from opendbc.car.tesla.radar_interface import RadarInterface
+ 
+ 
+ class CarInterface(CarInterfaceBase):
+@@ -13,6 +14,9 @@ class CarInterface(CarInterfaceBase):
+ 
+   @staticmethod
+   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
++    if candidate in LEGACY_CARS:
++      return CarInterface._get_params_sx(ret, candidate, fingerprint, car_fw, alpha_long, is_release, docs)
++
+     ret.brand = "tesla"
+ 
+     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.tesla)]
+@@ -48,6 +52,47 @@ class CarInterface(CarInterfaceBase):
+       ret.flags |= TeslaFlags.FSD_14.value
+       ret.safetyConfigs[0].safetyParam |= TeslaSafetyFlags.FSD_14.value
+ 
+-    ret.dashcamOnly = candidate in (CAR.TESLA_MODEL_X,)  # dashcam only, pending find invalidLkasSetting signal
++      # ret.dashcamOnly = candidate in (CAR.TESLA_MODEL_X) # dashcam only, pending find invalidLkasSetting signal
++
++    return ret
++
++  @staticmethod
++  def _get_params_sx(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
++    ret.brand = "tesla"
++
++    if not any(0x201 in f for f in fingerprint.values()):
++      ret.flags |= TeslaLegacyParams.NO_SDM1.value
++
++    if candidate in (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_X_HW1, ):
++      ret.safetyConfigs = [
++        get_safety_config(structs.CarParams.SafetyModel.teslaLegacy, int(TeslaSafetyFlags.FLAG_HW1)),
++      ]
++    elif candidate in (CAR.TESLA_MODEL_S_HW2, CAR.TESLA_MODEL_X_HW2):
++      ret.safetyConfigs = [
++        get_safety_config(structs.CarParams.SafetyModel.teslaLegacy, int(TeslaSafetyFlags.FLAG_HW2)),
++        get_safety_config(structs.CarParams.SafetyModel.teslaLegacy, int(TeslaSafetyFlags.FLAG_HW2 | TeslaSafetyFlags.FLAG_EXTERNAL_PANDA)),
++      ]
++    elif candidate in (CAR.TESLA_MODEL_S_HW3,):
++      ret.safetyConfigs = [
++        get_safety_config(structs.CarParams.SafetyModel.teslaLegacy, int(TeslaSafetyFlags.FLAG_HW3)),
++        get_safety_config(structs.CarParams.SafetyModel.teslaLegacy, int(TeslaSafetyFlags.FLAG_HW3 | TeslaSafetyFlags.FLAG_EXTERNAL_PANDA)),
++      ]
++
++    ret.steerLimitTimer = 0.4
++    ret.steerActuatorDelay = 0.1
++    ret.steerAtStandstill = True
++
++    ret.steerControlType = structs.CarParams.SteerControlType.angle
++    ret.radarUnavailable = candidate in (CAR.TESLA_MODEL_S_HW2, )
++
++    ret.alphaLongitudinalAvailable = True
++    ret.openpilotLongitudinalControl = True
++    ret.safetyConfigs[0].safetyParam |= TeslaSafetyFlags.LONG_CONTROL.value
++
++    ret.vEgoStopping = 0.1
++    ret.vEgoStarting = 0.1
++    ret.stoppingDecelRate = 0.3
++
++    # ret.dashcamOnly = candidate in (CAR.TESLA_MODEL_X) # dashcam only, pending find invalidLkasSetting signal
+ 
+     return ret
+diff --git a/opendbc/car/tesla/radar_interface.py b/opendbc/car/tesla/radar_interface.py
+index e0cfcd1b..676a6ef2 100644
+--- a/opendbc/car/tesla/radar_interface.py
++++ b/opendbc/car/tesla/radar_interface.py
+@@ -1,33 +1,62 @@
+ from opendbc.can import CANParser
+ from opendbc.car import Bus, structs
+ from opendbc.car.interfaces import RadarInterfaceBase
+-from opendbc.car.tesla.values import DBC
++from opendbc.car.tesla.values import DBC, CAR, CANBUS
+ 
+ RADAR_START_ADDR = 0x410
+ RADAR_MSG_COUNT = 80  # 40 points * 2 messages each
+ 
++# Bosch radar is only on specific older vehicles and uses different CAN messages
++BOSCH_RADAR_CARS = (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_S_HW2, CAR.TESLA_MODEL_X_HW1, CAR.TESLA_MODEL_X_HW2)
++BOSCH_NUM_POINTS = 32
++BOSCH_RADAR_POINT_FRQ = 8
++BOSCH_TRIGGER_MSG = 878
++
++
++def _is_bosch_radar(CP):
++  return CP.carFingerprint in BOSCH_RADAR_CARS
++
+ 
+ def get_radar_can_parser(CP):
+   if Bus.radar not in DBC[CP.carFingerprint]:
+     return None
+ 
+-  messages = [('RadarStatus', 16)]
+-  for i in range(RADAR_MSG_COUNT // 2):
++  is_bosch = _is_bosch_radar(CP)
++
++  if is_bosch:
++    messages = [('TeslaRadarSguInfo', 8)]
++    num_points = BOSCH_NUM_POINTS
++    freq = BOSCH_RADAR_POINT_FRQ
++  else:
++    messages = [('RadarStatus', 16)]
++    num_points = RADAR_MSG_COUNT // 2
++    freq = 16
++
++  for i in range(num_points):
+     messages.extend([
+-      (f'RadarPoint{i}_A', 16),
+-      (f'RadarPoint{i}_B', 16),
++      (f'RadarPoint{i}_A', freq),
++      (f'RadarPoint{i}_B', freq),
+     ])
+ 
+-  return CANParser(DBC[CP.carFingerprint][Bus.radar], messages, 1)
++  return CANParser(DBC[CP.carFingerprint][Bus.radar], messages, CANBUS.radar)
+ 
+ 
+ class RadarInterface(RadarInterfaceBase):
+   def __init__(self, CP):
+     super().__init__(CP)
+     self.updated_messages = set()
+-    self.trigger_msg = RADAR_START_ADDR + RADAR_MSG_COUNT - 1
+     self.track_id = 0
+ 
++    self.bosch_radar = _is_bosch_radar(CP)
++    self.continental_radar = not self.bosch_radar and not CP.radarUnavailable
++
++    if self.bosch_radar:
++      self.trigger_msg = BOSCH_TRIGGER_MSG
++      self.num_points = BOSCH_NUM_POINTS
++    else:
++      self.trigger_msg = RADAR_START_ADDR + RADAR_MSG_COUNT - 1
++      self.num_points = RADAR_MSG_COUNT // 2
++
+     self.radar_off_can = CP.radarUnavailable
+     self.rcp = get_radar_can_parser(CP)
+ 
+@@ -38,8 +67,9 @@ class RadarInterface(RadarInterfaceBase):
+     vls = self.rcp.update(can_strings)
+     self.updated_messages.update(vls)
+ 
++    ret = structs.RadarData()
+     if self.trigger_msg not in self.updated_messages:
+-      return None
++      return ret
+ 
+     rr = self._update(self.updated_messages)
+     self.updated_messages.clear()
+@@ -54,13 +84,18 @@ class RadarInterface(RadarInterfaceBase):
+     if not self.rcp.can_valid:
+       ret.errors.canError = True
+ 
+-    radar_status = self.rcp.vl['RadarStatus']
+-    if radar_status['shortTermUnavailable']:
+-      ret.errors.radarUnavailableTemporary = True
+-    if radar_status['sensorBlocked'] or radar_status['vehDynamicsError']:
+-      ret.errors.radarFault = True
+-
+-    for i in range(RADAR_MSG_COUNT // 2):
++    if self.continental_radar:
++      radar_status = self.rcp.vl['RadarStatus']
++      if radar_status['shortTermUnavailable']:
++        ret.errors.radarUnavailableTemporary = True
++      if radar_status['sensorBlocked'] or radar_status['vehDynamicsError']:
++        ret.errors.radarFault = True
++    elif self.bosch_radar:
++      radar_status = self.rcp.vl['TeslaRadarSguInfo']
++      if radar_status['RADC_HWFail']:
++        ret.errors.radarFault = True
++
++    for i in range(self.num_points):
+       msg_a = self.rcp.vl[f'RadarPoint{i}_A']
+       msg_b = self.rcp.vl[f'RadarPoint{i}_B']
+ 
+@@ -73,6 +108,11 @@ class RadarInterface(RadarInterfaceBase):
+           del self.pts[i]
+         continue
+ 
++      if self.bosch_radar and (msg_a['LongDist'] > 250.0 or msg_a['LongDist'] <= 0 or msg_a['ProbExist'] < 50.0):
++        if i in self.pts:
++          del self.pts[i]
++        continue
++
+       if i not in self.pts:
+         self.pts[i] = structs.RadarData.RadarPoint()
+         self.pts[i].trackId = self.track_id
+diff --git a/opendbc/car/tesla/teslacan.py b/opendbc/car/tesla/teslacan.py
+index 902cc31b..2d6787dc 100644
+--- a/opendbc/car/tesla/teslacan.py
++++ b/opendbc/car/tesla/teslacan.py
+@@ -13,7 +13,10 @@ def get_steer_ctrl_type(flags: int, ctrl_type: int) -> int:
+ class TeslaCAN:
+   def __init__(self, CP, packer):
+     self.CP = CP
++    self.CCP = CarControllerParams
+     self.packer = packer
++    self.jerk_upper = self.CCP.JERK_LIMIT_MAX
++    self.jerk_lower = self.CCP.JERK_LIMIT_MIN
+ 
+   def create_steering_control(self, angle, enabled):
+     # On FSD 14+, ANGLE_CONTROL behavior changed to allow user winddown while actuating.
+@@ -28,22 +31,32 @@ class TeslaCAN:
+ 
+     return self.packer.make_can_msg("DAS_steeringControl", CANBUS.party, values)
+ 
+-  def create_longitudinal_command(self, acc_state, accel, counter, v_ego, active):
+-    set_speed = min(max(v_ego + accel, 0) * CV.MS_TO_KPH, 400)
++  def create_longitudinal_command(self, acc_state, accel, counter, v_ego, active, gas_pressed):
++    from opendbc.car.interfaces import V_CRUISE_MAX
++
++    set_speed = max(v_ego * CV.MS_TO_KPH, 0)
++    if active:
++      set_speed = 0 if accel < 0 else V_CRUISE_MAX
++
++    if gas_pressed:
++      self.jerk_upper = self.jerk_lower = 0.0
++    else:
++      self.jerk_lower = max(self.jerk_lower - self.CCP.JERK_RAMP_RATE, self.CCP.JERK_LIMIT_MIN)
++      self.jerk_upper = min(self.jerk_upper + self.CCP.JERK_RAMP_RATE, self.CCP.JERK_LIMIT_MAX)
+ 
+     values = {
+       "DAS_setSpeed": set_speed,
+       "DAS_accState": acc_state,
+       "DAS_aebEvent": 0,
+-      "DAS_jerkMin": CarControllerParams.JERK_LIMIT_MIN,
+-      "DAS_jerkMax": CarControllerParams.JERK_LIMIT_MAX,
++      "DAS_jerkMin": self.jerk_lower,
++      "DAS_jerkMax": self.jerk_upper,
+       "DAS_accelMin": accel,
+       "DAS_accelMax": max(accel, 0),
+       "DAS_controlCounter": counter,
+     }
+     return self.packer.make_can_msg("DAS_control", CANBUS.party, values)
+ 
+-  def create_steering_allowed(self):
++  def create_steering_allowed(self, counter):
+     values = {
+       "APS_eacAllow": 1,
+     }
+diff --git a/opendbc/car/tesla/teslacan_legacy.py b/opendbc/car/tesla/teslacan_legacy.py
+new file mode 100644
+index 00000000..3d905b77
+--- /dev/null
++++ b/opendbc/car/tesla/teslacan_legacy.py
+@@ -0,0 +1,65 @@
++from opendbc.car.common.conversions import Conversions as CV
++from opendbc.car.interfaces import V_CRUISE_MAX
++from opendbc.car.tesla.values import CANBUS, CarControllerParams
++
++
++class TeslaCANRaven:
++  def __init__(self, packers):
++    self.packers = packers
++    self.CCP = CarControllerParams
++    self.jerk_upper = self.CCP.JERK_LIMIT_MAX
++    self.jerk_lower = self.CCP.JERK_LIMIT_MIN
++
++  @staticmethod
++  def checksum(msg_id, dat):
++    ret = (msg_id & 0xFF) + ((msg_id >> 8) & 0xFF)
++    ret += sum(dat)
++    return ret & 0xFF
++
++  def create_steering_control(self, counter, angle, enabled):
++    values = {
++      "DAS_steeringControlCounter": counter,
++      "DAS_steeringAngleRequest": -angle,
++      "DAS_steeringHapticRequest": 0,
++      "DAS_steeringControlType": 1 if enabled else 0,
++    }
++
++    data = self.packers[CANBUS.party].make_can_msg("DAS_steeringControl", CANBUS.party, values)[1]
++    values["DAS_steeringControlChecksum"] = self.checksum(0x488, data[:3])
++    return self.packers[CANBUS.party].make_can_msg("DAS_steeringControl", CANBUS.party, values)
++
++  def create_longitudinal_command(self, acc_state, accel, counter, v_ego, active, gas_pressed):
++    set_speed = max(v_ego * CV.MS_TO_KPH, 0)
++    if active:
++      set_speed = 0 if accel < 0 else V_CRUISE_MAX
++
++    if gas_pressed:
++      self.jerk_upper = self.jerk_lower = 0.0
++    else:
++      self.jerk_lower = max(self.jerk_lower - self.CCP.JERK_RAMP_RATE, self.CCP.JERK_LIMIT_MIN)
++      self.jerk_upper = min(self.jerk_upper + self.CCP.JERK_RAMP_RATE, self.CCP.JERK_LIMIT_MAX)
++
++    values = {
++      "DAS_setSpeed": set_speed,
++      "DAS_accState": acc_state,
++      "DAS_aebEvent": 0,
++      "DAS_jerkMin": self.jerk_lower,
++      "DAS_jerkMax": self.jerk_upper,
++      "DAS_accelMin": accel,
++      "DAS_accelMax": max(accel, 0),
++      "DAS_controlCounter": counter,
++    }
++
++    data = self.packers[CANBUS.powertrain].make_can_msg("DAS_control", CANBUS.powertrain, values)[1]
++    values["DAS_controlChecksum"] = self.checksum(0x2b9, data[:7])
++    return self.packers[CANBUS.powertrain].make_can_msg("DAS_control", CANBUS.powertrain, values)
++
++  def create_steering_allowed(self, counter):
++    values = {
++      "APS_eacMonitorCounter": counter,
++      "APS_eacAllow": 1,
++    }
++
++    data = self.packers[CANBUS.party].make_can_msg("APS_eacMonitor", CANBUS.party, values)[1]
++    values["APS_eacMonitorChecksum"] = self.checksum(0x27d, data[:2])
++    return self.packers[CANBUS.party].make_can_msg("APS_eacMonitor", CANBUS.party, values)
+diff --git a/opendbc/car/tesla/values.py b/opendbc/car/tesla/values.py
+index 873abfea..8ad15c3a 100644
+--- a/opendbc/car/tesla/values.py
++++ b/opendbc/car/tesla/values.py
+@@ -62,6 +62,60 @@ class CAR(Platforms):
+     [TeslaCarDocsHW4("Tesla Model X (with HW4) 2024")],
+     CarSpecs(mass=2495., wheelbase=2.960, steerRatio=12.0),
+   )
++  TESLA_MODEL_X_HW1 = TeslaPlatformConfig(
++    [CarDocs("Tesla Model X (with HW1) 2014-16", "All", car_parts=CarParts.common([CarHarness.tesla_model_x_hw1]))],
++    CarSpecs(mass=2447., wheelbase=2.960, steerRatio=15.0),
++    {
++      Bus.chassis: 'tesla_can',
++      Bus.party: 'tesla_can',
++      Bus.pt: 'tesla_can',
++      Bus.radar: 'tesla_radar_bosch_generated',
++    },
++  )
++  TESLA_MODEL_X_HW2 = TeslaPlatformConfig(
++    [CarDocs("Tesla Model X (with HW2) 2016-19", "All", car_parts=CarParts.common([CarHarness.tesla_model_sx_hw2]))],
++    CarSpecs(mass=2100., wheelbase=2.960, steerRatio=15.0),
++    {
++      Bus.chassis: 'tesla_can',
++      Bus.party: 'tesla_can',
++      Bus.pt: 'tesla_powertrain',
++      Bus.radar: 'tesla_radar_bosch_generated',
++    },
++  )
++  TESLA_MODEL_S = TeslaPlatformConfig(
++    [TeslaCarDocsHW4("Tesla Model S (with HW4) 2024")],
++    CarSpecs(mass=2166., wheelbase=2.960, steerRatio=12.0),
++  )
++  TESLA_MODEL_S_HW1 = TeslaPlatformConfig(
++    [CarDocs("Tesla Model S (with HW1) 2014-16", "All", car_parts=CarParts.common([CarHarness.tesla_model_s_hw1]))],
++    CarSpecs(mass=2100., wheelbase=2.960, steerRatio=15.0),
++    {
++      Bus.chassis: 'tesla_can',
++      Bus.party: 'tesla_can',
++      Bus.pt: 'tesla_can',
++      Bus.radar: 'tesla_radar_bosch_generated',
++    },
++  )
++  TESLA_MODEL_S_HW2 = TeslaPlatformConfig(
++    [CarDocs("Tesla Model S (with HW2) 2017-19", "All", car_parts=CarParts.common([CarHarness.tesla_model_sx_hw2]))],
++    CarSpecs(mass=2100., wheelbase=2.960, steerRatio=15.0),
++    {
++      Bus.chassis: 'tesla_can',
++      Bus.party: 'tesla_can',
++      Bus.pt: 'tesla_powertrain',
++      Bus.radar: 'tesla_radar_bosch_generated',
++    },
++  )
++  TESLA_MODEL_S_HW3 = TeslaPlatformConfig(
++    [CarDocs("Tesla Model S (with HW3) 2020-23", "All", car_parts=CarParts.common([CarHarness.tesla_model_sx_hw3]))],
++    CarSpecs(mass=2100., wheelbase=2.960, steerRatio=15.0),
++    {
++      Bus.chassis: 'tesla_can',
++      Bus.party: 'tesla_raven_party',
++      Bus.pt: 'tesla_powertrain',
++      Bus.radar: 'tesla_radar_continental_generated',
++    },
++  )
+ 
+ 
+ FW_QUERY_CONFIG = FwQueryConfig(
+@@ -70,7 +124,19 @@ FW_QUERY_CONFIG = FwQueryConfig(
+       [StdQueries.TESTER_PRESENT_REQUEST, StdQueries.SUPPLIER_SOFTWARE_VERSION_REQUEST],
+       [StdQueries.TESTER_PRESENT_RESPONSE, StdQueries.SUPPLIER_SOFTWARE_VERSION_RESPONSE],
+       bus=0,
+-    )
++    ),
++    Request(
++      [StdQueries.TESTER_PRESENT_REQUEST, StdQueries.UDS_VERSION_REQUEST],
++      [StdQueries.TESTER_PRESENT_RESPONSE, StdQueries.UDS_VERSION_RESPONSE],
++      rx_offset=0x08,
++      bus=0,
++    ),
++    Request(
++      [StdQueries.TESTER_PRESENT_REQUEST, StdQueries.MANUFACTURER_SOFTWARE_VERSION_REQUEST],
++      [StdQueries.TESTER_PRESENT_RESPONSE, StdQueries.MANUFACTURER_SOFTWARE_VERSION_RESPONSE],
++      rx_offset=0x08,
++      bus=0,
++    ),
+   ]
+ )
+ 
+@@ -92,8 +158,14 @@ FSD_14_FW = {
+ class CANBUS:
+   party = 0
+   vehicle = 1
++  radar = 1
+   autopilot_party = 2
+ 
++  # only needed on raven
++  powertrain = 4
++  chassis = 5
++  autopilot_powertrain = 6
++
+ 
+ GEAR_MAP = {
+   "DI_GEAR_INVALID": CarState.GearShifter.unknown,
+@@ -131,11 +203,20 @@ class CarControllerParams:
+   ACCEL_MIN = -3.48  # m/s^2
+   JERK_LIMIT_MAX = 4.9  # m/s^3, ACC faults at 5.0
+   JERK_LIMIT_MIN = -4.9  # m/s^3, ACC faults at 5.0
++  JERK_RAMP_RATE = JERK_LIMIT_MAX * 0.002  # m/s^3 per control step, for smooth gas override
++
++
++class TeslaLegacyParams(IntFlag):
++  NO_SDM1 = 1
+ 
+ 
+ class TeslaSafetyFlags(IntFlag):
+   LONG_CONTROL = 1
+   FSD_14 = 2
++  FLAG_EXTERNAL_PANDA = 4
++  FLAG_HW1 = 8
++  FLAG_HW2 = 16
++  FLAG_HW3 = 32
+ 
+ 
+ class TeslaFlags(IntFlag):
+@@ -147,3 +228,5 @@ class TeslaFlags(IntFlag):
+ DBC = CAR.create_dbc_map()
+ 
+ STEER_THRESHOLD = 1
++
++LEGACY_CARS = (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_S_HW2, CAR.TESLA_MODEL_S_HW3, CAR.TESLA_MODEL_X_HW1, CAR.TESLA_MODEL_X_HW2)
+diff --git a/opendbc/car/tests/routes.py b/opendbc/car/tests/routes.py
+index 2fe80c0f..84985718 100644
+--- a/opendbc/car/tests/routes.py
++++ b/opendbc/car/tests/routes.py
+@@ -16,6 +16,7 @@ from opendbc.car.values import Platform
+ from opendbc.car.volkswagen.values import CAR as VOLKSWAGEN
+ from opendbc.car.body.values import CAR as COMMA
+ from opendbc.car.psa.values import CAR as PSA
++from opendbc.car.mg.values import CAR as MG
+ 
+ # FIXME: add routes for these cars
+ non_tested_cars = [
+@@ -348,6 +349,11 @@ routes = [
+   CarTestRoute("c8a98e58647765ad/00000002--84e4746136", TESLA.TESLA_MODEL_Y),
+   CarTestRoute("2c912ca5de3b1ee9/0000025d--6eb6bcbca4", TESLA.TESLA_MODEL_Y, segment=4),
+   CarTestRoute("bdda168c0c35fad7/00000001--5c5a36ec06", TESLA.TESLA_MODEL_X), # openpilot longitudinal
++  CarTestRoute("9227f2c54e175788/00000000--650ad7d3e0", TESLA.TESLA_MODEL_S_HW1),
++  CarTestRoute("026a62571e42f996/00000000--75adbce194", TESLA.TESLA_MODEL_S_HW2),
++  CarTestRoute("66c1699b7697267d/00000176--4b6b80db68", TESLA.TESLA_MODEL_S_HW3),
++
++  CarTestRoute("5d61e2f6e1f247f3/00000054--d3dfb01b34", MG.MG_5_EV),
+ 
+   # Segments that test specific issues
+   # Controls mismatch due to standstill threshold
+diff --git a/opendbc/car/tests/test_fw_fingerprint.py b/opendbc/car/tests/test_fw_fingerprint.py
+index 811347bb..91ff9999 100644
+--- a/opendbc/car/tests/test_fw_fingerprint.py
++++ b/opendbc/car/tests/test_fw_fingerprint.py
+@@ -262,7 +262,7 @@ class TestFwFingerprintTiming(unittest.TestCase):
+         print(f'get_vin {name} case, query time={self.total_time / self.N} seconds')
+ 
+   def test_fw_query_timing(self):
+-    total_ref_time = 7.4
++    total_ref_time = 7.5
+     brand_ref_times = {
+       'gm': 1.0,
+       'body': 0.1,
+@@ -271,6 +271,7 @@ class TestFwFingerprintTiming(unittest.TestCase):
+       'honda': 0.45,
+       'hyundai': 0.65,
+       'mazda': 0.1,
++      'mg': 0.1,
+       'nissan': 0.8,
+       'subaru': 0.65,
+       'tesla': 0.1,
+diff --git a/opendbc/car/torque_data/override.toml b/opendbc/car/torque_data/override.toml
+index f6bab760..51bfb97d 100644
+--- a/opendbc/car/torque_data/override.toml
++++ b/opendbc/car/torque_data/override.toml
+@@ -22,6 +22,12 @@ legend = ["LAT_ACCEL_FACTOR", "MAX_LAT_ACCEL_MEASURED", "FRICTION"]
+ "TESLA_MODEL_3" = [nan, 2.5, nan]
+ "TESLA_MODEL_Y" = [nan, 2.5, nan]
+ "TESLA_MODEL_X" = [nan, 2.5, nan]
++"TESLA_MODEL_X_HW1" = [nan, 2.5, nan]
++"TESLA_MODEL_X_HW2" = [nan, 2.5, nan]
++"TESLA_MODEL_S" = [nan, 2.5, nan]
++"TESLA_MODEL_S_HW1" = [nan, 2.5, nan]
++"TESLA_MODEL_S_HW2" = [nan, 2.5, nan]
++"TESLA_MODEL_S_HW3" = [nan, 2.5, nan]
+ 
+ # Guess
+ "FORD_BRONCO_SPORT_MK1" = [nan, 1.5, nan]
+@@ -76,6 +82,8 @@ legend = ["LAT_ACCEL_FACTOR", "MAX_LAT_ACCEL_MEASURED", "FRICTION"]
+ "KIA_K8_HEV_1ST_GEN" = [2.5, 2.5, 0.1]
+ "HYUNDAI_CUSTIN_1ST_GEN" = [2.5, 2.5, 0.1]
+ "LEXUS_GS_F" = [2.5, 2.5, 0.08]
++"MG_5_EV" = [1.2, 2.5, 0.18]
++"MG_ZS_EV" = [1.2, 2.5, 0.18]
+ "HYUNDAI_STARIA_4TH_GEN" = [1.8, 2.0, 0.15]
+ "GENESIS_GV70_ELECTRIFIED_1ST_GEN" = [1.9, 1.9, 0.09]
+ "GENESIS_G80_2ND_GEN_FL" = [2.5819356441497803, 2.5, 0.11244568973779678]
+diff --git a/opendbc/car/values.py b/opendbc/car/values.py
+index f606249a..1101fb4e 100644
+--- a/opendbc/car/values.py
++++ b/opendbc/car/values.py
+@@ -10,12 +10,13 @@ from opendbc.car.mock.values import CAR as MOCK
+ from opendbc.car.nissan.values import CAR as NISSAN
+ from opendbc.car.psa.values import CAR as PSA
+ from opendbc.car.rivian.values import CAR as RIVIAN
++from opendbc.car.mg.values import CAR as MG
+ from opendbc.car.subaru.values import CAR as SUBARU
+ from opendbc.car.tesla.values import CAR as TESLA
+ from opendbc.car.toyota.values import CAR as TOYOTA
+ from opendbc.car.volkswagen.values import CAR as VOLKSWAGEN
+ 
+-Platform = BODY | CHRYSLER | FORD | GM | HONDA | HYUNDAI | MAZDA | MOCK | NISSAN | PSA | RIVIAN | SUBARU | TESLA | TOYOTA | VOLKSWAGEN
++Platform = BODY | CHRYSLER | FORD | GM | HONDA | HYUNDAI | MAZDA | MOCK | MG | NISSAN | PSA | RIVIAN | SUBARU | TESLA | TOYOTA | VOLKSWAGEN
+ BRANDS = get_args(Platform)
+ 
+ PLATFORMS: dict[str, Platform] = {str(platform): platform for brand in BRANDS for platform in brand}
+diff --git a/opendbc/dbc/generator/tesla/tesla_radar_bosch.py b/opendbc/dbc/generator/tesla/tesla_radar_bosch.py
+index b8445832..32a18f32 100755
+--- a/opendbc/dbc/generator/tesla/tesla_radar_bosch.py
++++ b/opendbc/dbc/generator/tesla/tesla_radar_bosch.py
+@@ -43,7 +43,7 @@ BS_:
+ BU_:  Autopilot Radar Diag
+ 
+ 
+-BO_ 769 TeslaRadarSguInfo: 8 Radar
++BO_ 769 TeslaRadarSguInfo: 6 Radar
+  SG_ RADC_VerticalMisalignment : 0|8@1+ (1,0) [0|255] ""  Autopilot
+  SG_ RADC_SCUTemperature : 8|8@1+ (1,-128) [-128|127] ""  Autopilot
+  SG_ RADC_VMA_Plaus : 16|8@1+ (1,0) [0|255] ""  Autopilot
+diff --git a/opendbc/dbc/mg.dbc b/opendbc/dbc/mg.dbc
+new file mode 100644
+index 00000000..30516ce4
+--- /dev/null
++++ b/opendbc/dbc/mg.dbc
+@@ -0,0 +1,316 @@
++VERSION "HSCAN2"
++
++
++NS_ :
++	NS_DESC_
++	CM_
++	BA_DEF_
++	BA_
++	VAL_
++	CAT_DEF_
++	CAT_
++	FILTER
++	BA_DEF_DEF_
++	EV_DATA_
++	ENVVAR_DATA_
++	SGTYPE_
++	SGTYPE_VAL_
++	BA_DEF_SGTYPE_
++	BA_SGTYPE_
++	SIG_TYPE_REF_
++	VAL_TABLE_
++	SIG_GROUP_
++	SIG_VALTYPE_
++	SIGTYPE_VALTYPE_
++	BO_TX_BU_
++	BA_DEF_REL_
++	BA_REL_
++	BA_DEF_DEF_REL_
++	BU_SG_REL_
++	BU_EV_REL_
++	BU_BO_REL_
++	SG_MUL_VAL_
++
++BS_:
++
++BU_: FVCM GW Diagnostics EPS SCSABS Tester
++
++BO_ 175 GW_HSC2_HCU_FrP00: 8 GW
++ SG_ EPTAccelActuPosHSC2 : 7|8@0+ (0.392157,0) [0|100] "%"  FVCM
++ SG_ EPTAccelActuPosVHSC2 : 43|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ EPTBrkPdlDscrtInptStsHSC2 : 31|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ EPTBrkPdlDscrtInptStsVHSC2 : 16|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ EPTStCmdOn_h1HSC2 : 17|1@0+ (1,0) [0|1] ""  FVCM
++
++BO_ 251 GW_HSC2_ECM_FrP27: 8 GW
++ SG_ ACCStsHSC2 : 2|1@0+ (1,0) [0|1] "" XXX
++ SG_ SpdAstMdECMHSC2 : 52|2@0+ (1,0) [0|3] ""  FVCM
++ SG_ SpdAstSysStsECMHSC2 : 18|3@0+ (1,0) [0|7] ""  FVCM
++ SG_ SpdAstSysTrgtSpdHSC2 : 30|15@0+ (0.015625,0) [0|511.984] ""  FVCM
++ SG_ TrgtSpdSrcStsHSC2 : 23|2@0+ (1,0) [0|3] ""  FVCM
++
++BO_ 355 GW_HSC2_SDM_FrP00: 8 GW
++ SG_ AirbagDplHSC2 : 11|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ AirbagDplInvsnHSC2 : 10|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ DrvrSbltAtcHSC2 : 12|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ DrvrSbltAtcVHSC2 : 13|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ SDMRCHSC2 : 1|2@0+ (1,0) [0|3] ""  FVCM
++
++BO_ 359 FVCM_HSC2_FrP02: 8 FVCM
++ SG_ AutoMainBeamLghtReqHSC2 : 15|2@0+ (1,0) [0|3] ""  GW
++ SG_ DistSinceTrgtCamrHSC2 : 7|8@0+ (8.235,-100) [-100|1999.92] "m"  GW
++ SG_ FVCMCalPrgsReqHSC2 : 36|3@0+ (1,0) [0|7] ""  GW
++ SG_ HandOffStrgWhlDetnStaHSC2 : 44|2@0+ (1,0) [0|3] ""  GW
++ SG_ HandOffStrgWhlDetnStaVHSC2 : 45|1@0+ (1,0) [0|1] ""  GW
++ SG_ LDWLKADspCmdHSC2 : 50|3@0+ (1,0) [0|7] ""  GW
++ SG_ LDWLKAHapticWrnngDspCmdHSC2 : 63|2@0+ (1,0) [0|3] ""  GW
++ SG_ LDWLKALVsulznReqHSC2 : 53|3@0+ (1,0) [0|7] ""  GW
++ SG_ LDWLKARVsulznReqHSC2 : 42|3@0+ (1,0) [0|7] ""  GW
++ SG_ LDWSysFltStsHSC2 : 39|3@0+ (1,0) [0|7] ""  GW
++ SG_ SpdAstReqStsCamrHSC2 : 13|2@0+ (1,0) [0|3] ""  GW
++ SG_ TJAICADspCmdHSC2 : 55|2@0+ (1,0) [0|3] ""  GW
++ SG_ TJAICASysFltStsHSC2 : 61|3@0+ (1,0) [0|7] ""  GW,EPS
++ SG_ TJAICASysStsHSC2 : 58|3@0+ (1,0) [0|7] ""  GW,EPS
++ SG_ TrgtSpdReqCamrHSC2 : 22|15@0+ (0.015625,0) [0|511.984] ""  GW
++
++BO_ 404 GW_HSC2_ECM_FrP04: 8 GW
++ SG_ TrEstdGearHSC2 : 3|4@0+ (1,0) [0|15] ""  FVCM
++ SG_ TrEstdGearVHSC2 : 4|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ TrShftLvrPosV_h1HSC2 : 28|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ TrShftLvrPos_h1HSC2 : 27|4@0+ (1,0) [0|15] ""  FVCM
++
++BO_ 438 EHBS_HSC2_FrP00: 8 EHBS
++ SG_ BrkPdlAppdChksmHSC2 : 63|8@0+ (1,0) [0|255] ""  FVCM
++ SG_ IbstrDiagMdAHSC2 : 55|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ RnotPrsStsHSC2 : 53|2@0+ (1,0) [0|3] ""  FVCM
++ SG_ HydBstrCmpstnReqHSC2 : 54|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ BrkPdlAppdRCHSC2 : 51|4@0+ (1,0) [0|15] ""  FVCM
++ SG_ RnotPrsHSC2 : 47|8@0+ (1,0) [0|250] "bar"  FVCM
++ SG_ BrkPdlAppdHSC2 : 10|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ BrkPdlAppdVHSC2 : 9|2@0+ (1,0) [0|3] ""  FVCM
++
++BO_ 485 SAS_HSC2_FrP00: 8 EPS
++ SG_ StrgWhlAngHSC2 : 15|16@0+ (0.0625,-2048) [-2048|2047.88] "degree"  FVCM
++ SG_ StrgWhlAngAlvRCHSC2 : 31|4@0+ (1,0) [0|15] ""  FVCM
++ SG_ StrgWhlAngExtdPVHSC2 : 47|16@0+ (1,0) [0|65535] ""  FVCM
++ SG_ StrgWhlAngGrdHSC2 : 27|12@0+ (1,-2048) [-2048|2046] "degree/s"  FVCM
++ SG_ StrgWhlAngSnsrCalStsHSC2 : 6|2@0+ (1,0) [0|3] ""  FVCM
++ SG_ StrgWhlAngSnsrChksmHSC2 : 63|8@0+ (1,0) [0|255] ""  FVCM
++ SG_ StrgWhlAngSnsrFltHSC2 : 0|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ StrgWhlAngSnsrInidHSC2 : 2|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ StrgWhlAngSnsrMultCapbHSC2 : 1|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ StrgWhlAngVHSC2 : 7|1@0+ (1,0) [0|1] ""  FVCM
++
++BO_ 481 GW_HSC2_FrP04: 7 GW
++ SG_ CCSwStsSwDataIntgty_h2HSC2 : 1|2@0+ (1,0) [0|3] "" FDR
++ SG_ CCSwStsSpdDecSwA_h2HSC2 : 2|1@0+ (1,0) [0|1] "" FDR
++ SG_ CCSwStsSpdIncSwA_h2HSC2 : 3|1@0+ (1,0) [0|1] "" FDR
++ SG_ CCSwStsSetSwA_h2HSC2 : 4|1@0+ (1,0) [0|1] "" FDR
++ SG_ CCSwStsRsmSwA_h2HSC2 : 5|1@0+ (1,0) [0|1] "" FDR
++ SG_ CCSwStsOnSwA_h2HSC2 : 6|1@0+ (1,0) [0|1] "" FDR
++ SG_ CCSwStsCanclSwA_h2HSC2 : 7|1@0+ (1,0) [0|1] "" FDR
++ SG_ CCSwStsPV_h2HSC2 : 15|8@0+ (1,0) [0|255] "" FDR
++ SG_ CCSwStsAlvRC_h2HSC2 : 17|2@0+ (1,0) [0|3] "" FDR
++ SG_ CCSwStsDistDecSwA_h2HSC2 : 18|1@0+ (1,0) [0|1] "" FDR
++ SG_ CCSwStsDistIncSwA_h2HSC2 : 19|1@0+ (1,0) [0|1] "" FDR
++
++BO_ 492 EPS_HSC2_FrP03: 8 EPS
++ SG_ ChLKAAlvRCHSC2 : 7|4@0+ (1,0) [0|15] ""  FVCM
++ SG_ ChLKACtrlStsHSC2 : 54|3@0+ (1,0) [0|7] ""  FVCM
++ SG_ ChLKARespToqHSC2 : 2|11@0+ (0.01,-10.24) [-10.24|10.23] "Nm"  FVCM
++ SG_ ChLKARespToqPVHSC2 : 22|15@0+ (1,0) [0|32767] ""  FVCM
++ SG_ ChLKARespToqVHSC2 : 3|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ DrvrStrgDlvrdToqHSC2 : 34|11@0+ (0.01,-10.24) [-10.24|10.23] "Nm"  FVCM
++ SG_ DrvrStrgDlvrdToqVHSC2 : 55|1@0+ (1,0) [0|1] ""  FVCM
++
++BO_ 509 FVCM_HSC2_FrP03: 8 FVCM
++ SG_ LDWLKAVbnLvlReqHSC2 : 23|2@0+ (1,0) [0|3] ""  GW,EPS
++ SG_ LKAAlvRCHSC2 : 7|4@0+ (1,0) [0|15] ""  EPS
++ SG_ LKADrvrTkovReqHSC2 : 46|1@0+ (1,0) [0|1] ""  GW,EPS
++ SG_ LKAReqToqHSC2 : 2|11@0+ (1,-1024) [-1024|1023] "Nm"  EPS
++ SG_ LKAReqToqPVHSC2 : 21|14@0+ (1,0) [0|16383] ""  EPS
++ SG_ LKAReqToqStsHSC2 : 36|2@0+ (1,0) [0|3] ""  EPS
++ SG_ LKAReqToqVHSC2 : 3|1@0+ (1,0) [0|1] ""  EPS
++ SG_ LKASysFltStsHSC2 : 39|3@0+ (1,0) [0|7] ""  GW,EPS
++ SG_ LKASysStsHSC2 : 34|3@0+ (1,0) [0|7] ""  GW,EPS
++
++BO_ 532 SCS_HSC2_FrP09: 6 SCSABS
++ SG_ BrkPdlDrvrAppdPrsHSC2 : 15|8@0+ (75,0) [0|19125] "kPa"  FVCM
++ SG_ BrkPdlDrvrAppdPrsAlvRCHSC2 : 2|2@0+ (1,0) [0|3] ""  FVCM
++ SG_ BrkPdlDrvrAppdPrsVHSC2 : 0|1@0+ (1,0) [0|1] ""  FVCM
++
++BO_ 572 SCS_HSC2_FrP19: 8 SCSABS
++ SG_ VehSpdAvgHSC2 : 22|15@0+ (0.015625,0) [0|511.984] "km/h"  FVCM,FDR
++ SG_ VehSpdAvgAlvRCHSC2 : 39|4@0+ (1,0) [0|15] ""  FVCM,FDR
++ SG_ VehSpdAvgPVHSC2 : 7|16@0+ (1,0) [0|65535] ""  FVCM,FDR
++ SG_ VehSpdAvgVHSC2 : 23|1@0+ (1,0) [0|1] ""  FVCM,FDR
++
++BO_ 578 RADAR_HSC2_FrP00: 8 FDR
++ SG_ ACCAccReqValHSC2 : 2|11@0+ (0.005,-7.22) [-7.22|3.015] "" SCSABS
++ SG_ ACCSysAlvRlngCtr_SCSHSC2 : 6|4@0+ (1,0) [0|15] "" SCSABS
++ SG_ ACCMinBrkReqStsHSC2 : 7|1@0+ (1,0) [0|1] "" SCSABS
++ SG_ ACCAccReqValTolMaxHSC2 : 22|7@0+ (0.025,0) [0|3.175] "" SCSABS
++ SG_ ACCReqBrkPrfrdHSC2 : 23|1@0+ (1,0) [0|1] "" SCSABS
++ SG_ ACCAccReqStsHSC2 : 29|2@0+ (1,0) [0|3] "" GW,SCSABS
++ SG_ ACCGoReqHSC2 : 30|1@0+ (1,0) [0|1] "" SCSABS
++ SG_ ACCSysFltSts_SCSHSC2 : 42|3@0+ (1,0) [0|7] "" SCSABS
++ SG_ ACCSysSts_RadarHSC2 : 45|3@0+ (1,0) [0|7] "" GW,SCSABS
++ SG_ ChACCShtdwnMdHSC2 : 47|2@0+ (1,0) [0|3] "" SCSABS
++ SG_ ACCAccReqValTolMinHSC2 : 54|7@0+ (0.025,0) [0|3.175] "" SCSABS
++ SG_ ACCSdslReq_RadarHSC2 : 55|1@0+ (1,0) [0|1] "" SCSABS
++ SG_ ACCSysChksm_SCSHSC2 : 63|8@0+ (1,0) [0|255] "" SCSABS
++
++BO_ 582 RADAR_HSC2_FrP02: 8 FDR
++ SG_ ACCDrvrSelTrgtSpd_RadarHSC2 : 6|15@0+ (0.015625,0) [0|511.984] "" GW
++ SG_ ACCObjDet_RadarHSC2 : 7|1@0+ (1,0) [0|1] "" GW
++ SG_ AEBMsgReqHSC2 : 19|4@0+ (1,0) [0|15] "" GW
++ SG_ ACCMsgReqHSC2 : 23|4@0+ (1,0) [0|15] "" GW
++ SG_ ACCDetObjDistLvl_RadarHSC2 : 26|3@0+ (1,0) [0|7] "" GW
++ SG_ ACCDrvrSeldTrgtDistLvl_RadarHSC2 : 29|3@0+ (1,0) [0|7] "" GW
++ SG_ ACCSysCanclReq_RadarHSC2 : 31|2@0+ (1,0) [0|3] "" GW
++ SG_ RdrCalPrgsReqHSC2 : 34|3@0+ (1,0) [0|7] "" GW
++ SG_ ACCGoNotfr_RadarHSC2 : 35|1@0+ (1,0) [0|1] "" GW
++ SG_ ACCSysFltSts_RadarHSC2 : 38|3@0+ (1,0) [0|7] "" GW
++ SG_ ACCDrvrTkovReqHSC2 : 39|1@0+ (1,0) [0|1] "" GW
++ SG_ FCWSysFltSts_RadarHSC2 : 42|3@0+ (1,0) [0|7] "" GW
++ SG_ FCWSnstvtLvl_RadarHSC2 : 45|3@0+ (1,0) [0|7] "" GW
++ SG_ AEBPedtrnDspCmdHSC2 : 47|2@0+ (1,0) [0|3] "" GW
++ SG_ FCWrnngSts_RadarHSC2 : 51|3@0+ (1,0) [0|7] "" GW
++ SG_ FCWDspCmd_RadarHSC2 : 53|2@0+ (1,0) [0|3] "" GW
++ SG_ AEBDspCmd_RadarHSC2 : 55|2@0+ (1,0) [0|3] "" GW
++
++BO_ 588 SCS_HSC2_FrP22: 8 SCSABS
++ SG_ BrkDiscTemStsHSC2 : 6|1@0+ (1,0) [0|1] ""  FDR
++ SG_ BrkPdlDrvrAppdPrsAlvRC_RadarHSC2 : 13|2@0+ (1,0) [0|3] ""  FDR
++ SG_ BrkPdlDrvrAppdPrsV_RadarHSC2 : 7|1@0+ (1,0) [0|1] ""  FDR
++ SG_ BrkPdlDrvrAppdPrs_RadarHSC2 : 23|8@0+ (75,0) [0|19125] "kPa"  FDR
++ SG_ LDrvnWhlRotlDircnHSC2 : 15|2@0+ (1,0) [0|3] ""  FDR,FVCM
++ SG_ RDrvnWhlRotlDircnHSC2 : 2|2@0+ (1,0) [0|3] ""  FDR,FVCM
++ SG_ WhlBrkPrsStsHSC2 : 5|1@0+ (1,0) [0|1] ""  FDR
++ SG_ WhlGndVelDrvnChksm_RadarHSC2 : 63|8@0+ (1,0) [0|255] ""  FDR
++ SG_ WhlGndVelDrvnRC_RadarHSC2 : 11|4@0+ (1,0) [0|15] ""  FDR
++ SG_ WhlGndVelLDrvnV_RadarHSC2 : 3|1@0+ (1,0) [0|1] ""  FDR
++ SG_ WhlGndVelLDrvn_RadarHSC2 : 45|14@0+ (0.03125,0) [0|511.969] "km/h"  FDR
++ SG_ WhlGndVelRDrvnV_RadarHSC2 : 4|1@0+ (1,0) [0|1] ""  FDR
++ SG_ WhlGndVelRDrvn_RadarHSC2 : 29|14@0+ (0.03125,0) [0|511.969] "km/h"  FDR
++
++BO_ 593 SCS_HSC2_FrP24: 8 SCSABS
++ SG_ ChACCAccReqRespHSC2 : 5|3@0+ (1,0) [0|7] ""  FDR
++ SG_ ChACCAEBAlvRlngCtr_RadarHSC2 : 20|4@0+ (1,0) [0|15] ""  FDR
++ SG_ ChACCAEBBrkJerkReqRespHSC2 : 10|3@0+ (1,0) [0|7] ""  FDR
++ SG_ ChACCAEBChksm_RadarHSC2 : 63|8@0+ (1,0) [0|255] ""  FDR
++ SG_ ChACCReqFlrStsHSC2 : 15|2@0+ (1,0) [0|3] ""  FDR
++ SG_ ChAEBDclReqRespHSC2 : 23|3@0+ (1,0) [0|7] ""  FDR
++ SG_ ChAEBHydBrkAstReqRespHSC2 : 2|3@0+ (1,0) [0|7] ""  FDR
++ SG_ ChAEBPrflReqRespHSC2 : 13|3@0+ (1,0) [0|7] ""  FDR
++ SG_ VehSdslStsHSC2 : 7|2@0+ (1,0) [0|3] ""  FDR
++ SG_ VehTrgtLongtAccHSC2 : 31|8@0+ (0.05,-7) [-7|5.75] ""  FDR
++
++BO_ 851 SCS_HSC2_FrP15: 8 SCSABS
++ SG_ VehSpdAvgDrvnHSC2 : 6|15@0+ (0.015625,0) [0|511.984] "km/h"  FVCM
++ SG_ VehSpdAvgDrvnVHSC2 : 7|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ VehSpdAvgNonDrvnHSC2 : 38|15@0+ (0.015625,0) [0|511.984] "km/h"  FVCM
++ SG_ VehSpdAvgNonDrvnVHSC2 : 39|1@0+ (1,0) [0|1] ""  FVCM
++
++BO_ 1130 GW_HSC2_BCM_FrP04: 8 GW
++ SG_ DipdBeamLghtOnHSC2 : 13|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ DircnIndLampSwStsHSC2 : 3|2@0+ (1,0) [0|3] ""  FVCM
++ SG_ DspMeasSysHSC2 : 44|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ FrtFogLghtOnHSC2 : 14|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ FrtWiperParkPosAHSC2 : 52|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ FrtWshrPumpAHSC2 : 55|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ LDircnIndLghtFHSC2 : 10|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ LDircnIOHSC2 : 11|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ MainBeamLghtOnHSC2 : 15|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ RDircnIndLghtFHSC2 : 48|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ RDircnIOHSC2 : 9|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ RrFogLghtOnHSC2 : 8|1@0+ (1,0) [0|1] ""  FVCM
++ SG_ VehSideLghtStsHSC2 : 57|2@0+ (1,0) [0|3] ""  FVCM
++
++VAL_ 355 AirbagDplInvsnHSC2 1 "No Airbag Deployed" 0 "Airbag Deployed";
++VAL_ 355 AirbagDplHSC2 1 "True" 0 "False";
++VAL_ 355 DrvrSbltAtcHSC2 1 "True" 0 "False";
++VAL_ 355 DrvrSbltAtcVHSC2 1 "Invalid" 0 "Valid";
++VAL_ 404 TrEstdGearHSC2 15 "Park Gear" 14 "Reverse Gear" 13 "Neutral Gear" 8 "Eighth Gear" 7 "Seventh Gear" 6 "Sixth Gear" 5 "Fifth Gear" 4 "Fourth Gear" 3 "Third Gear" 2 "Second Gear" 1 "First Gear" 0 "Not Supported";
++VAL_ 404 TrEstdGearVHSC2 1 "Invalid" 0 "Valid";
++VAL_ 404 TrShftLvrPos_h1HSC2 15 "Lever Position Unknown" 11 "Forward Range H" 10 "Forward Range G" 9 "Forward Range F" 8 "Forward Range E" 7 "Forward Range D" 6 "Forward Range C" 5 "Forward Range B" 4 "Forward Range A" 3 "Neutral Range" 2 "Reverse Range" 1 "Park Range" 0 "Between Ranges";
++VAL_ 404 TrShftLvrPosV_h1HSC2 1 "Invalid" 0 "Valid";
++VAL_ 438 RnotPrsStsHSC2 2 "Faulty" 1 "Normal" 0 "Init" ;
++VAL_ 438 HydBstrCmpstnReqHSC2 1 "HBC active" 0 "HBC inactive" ;
++VAL_ 438 BrkPdlAppdHSC2 1 "brake pedal applied" 0 "brake pedal not applied" ;
++VAL_ 438 BrkPdlAppdVHSC2 2 "Faulty" 1 "Normal" 0 "Init" ;
++VAL_ 481 CCSwStsSwDataIntgty_h2HSC2 3 "Illegal Range" 2 "Failure Detected" 1 "Data Invalid" 0 "Data Valid";
++VAL_ 481 CCSwStsSpdDecSwA_h2HSC2 1 "True" 0 "False";
++VAL_ 481 CCSwStsSpdIncSwA_h2HSC2 1 "True" 0 "False";
++VAL_ 481 CCSwStsSetSwA_h2HSC2 1 "True" 0 "False";
++VAL_ 481 CCSwStsRsmSwA_h2HSC2 1 "True" 0 "False";
++VAL_ 481 CCSwStsOnSwA_h2HSC2 1 "True" 0 "False";
++VAL_ 481 CCSwStsCanclSwA_h2HSC2 1 "True" 0 "False";
++VAL_ 481 CCSwStsDistDecSwA_h2HSC2 1 "True" 0 "False";
++VAL_ 481 CCSwStsDistIncSwA_h2HSC2 1 "True" 0 "False";
++VAL_ 509 LKAReqToqVHSC2 1 "Invalid" 0 "Valid";
++VAL_ 509 LDWLKAVbnLvlReqHSC2 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "no request";
++VAL_ 509 LKASysStsHSC2 3 "Override" 2 "Active" 1 "Stand by" 0 "Off";
++VAL_ 509 LKAReqToqStsHSC2 3 "reserved" 2 "reserved" 1 "torque request" 0 "no request";
++VAL_ 509 LKASysFltStsHSC2 3 "service required" 2 "system temporary unavailable" 1 "performance degradation" 0 "no error";
++VAL_ 509 LKADrvrTkovReqHSC2 1 "True" 0 "False";
++VAL_ 578 ACCMinBrkReqStsHSC2 1 "no demand" 0 "demand";
++VAL_ 578 ACCReqBrkPrfrdHSC2 1 "no demand" 0 "demand";
++VAL_ 578 ACCAccReqStsHSC2 1 "ACC Acceleration Request" 0 "No Request";
++VAL_ 578 ACCGoReqHSC2 1 "Request" 0 "No Request";
++VAL_ 578 ACCSysFltSts_SCSHSC2 7 "Reserved" 6 "Reserved" 5 "Reserved" 4 "Reserved" 3 "Service Required" 2 "System Temporary Unvailable" 1 "Performance Degradation" 0 "No Error";
++VAL_ 578 ACCSysSts_RadarHSC2 7 "Reserved" 6 "Standstill Wait" 5 "Standstill Active" 4 "Brake Only" 3 "Override" 2 "Active" 1 "Stand By" 0 "Off";
++VAL_ 578 ChACCShtdwnMdHSC2 3 "immediate off" 2 "initial" 1 "fast off" 0 "soft off";
++VAL_ 578 ACCSdslReq_RadarHSC2 1 "request" 0 "no request";
++VAL_ 582 ACCObjDet_RadarHSC2 1 "TRUE" 0 "FALSE";
++VAL_ 582 AEBMsgReqHSC2 7 "reserved" 6 "Radar Error" 5 "AEB is switched off" 4 "AEB is switched on" 3 "AEB is in error mode" 2 "Active" 1 "unable to active AEB" 0 "No display";
++VAL_ 582 ACCMsgReqHSC2 15 "Reserved" 14 "Reserved" 13 "Reserved" 12 "Reserved" 11 "Reserved" 10 "Reserved" 9 "Radar Error" 8 "depress acceleration pedal or press resume switch to go" 7 "Driver Takeover Request" 6 "ACC is switched off" 5 "ACC is switched on" 4 "ACC is in error mode" 3 "Active" 2 "ACC is cancelled" 1 "unable to active ACC" 0 "No display";
++VAL_ 582 ACCDetObjDistLvl_RadarHSC2 7 "reserved" 6 "reserved" 5 "distance level5" 4 "distance level4" 3 "distance level3" 2 "distance level2" 1 "distance level1" 0 "no gap set";
++VAL_ 582 ACCDrvrSeldTrgtDistLvl_RadarHSC2 7 "reserved" 6 "reserved" 5 "distance level5" 4 "distance level4" 3 "distance level3" 2 "distance level2" 1 "distance level1" 0 "no gap set";
++VAL_ 582 ACCSysCanclReq_RadarHSC2 3 "Reserved" 2 "ACC Condition Dissatisfy" 1 "Manual Cancel" 0 "No Cancel";
++VAL_ 582 RdrCalPrgsReqHSC2 5 "calibration failure" 4 "Calibration Finished, need Adjust" 3 "Calibration Finished, Succesful" 2 "Calibration in progress" 1 "Calibration Started" 0 "no request";
++VAL_ 582 ACCGoNotfr_RadarHSC2 1 "TRUE" 0 "FALSE";
++VAL_ 582 ACCSysFltSts_RadarHSC2 7 "Reserved" 6 "Reserved" 5 "Reserved" 4 "Reserved" 3 "Service Required" 2 "System Temporary Unvailable" 1 "Performance Degradation" 0 "No Error";
++VAL_ 582 ACCDrvrTkovReqHSC2 1 "True" 0 "False";
++VAL_ 582 FCWSysFltSts_RadarHSC2 7 "Reserved" 6 "Reserved" 5 "Reserved" 4 "Reserved" 3 "Service required" 2 "System temporary unvailable" 1 "Performance degradation" 0 "No error";
++VAL_ 582 FCWSnstvtLvl_RadarHSC2 7 "reserved" 6 "reserved" 5 "reserved" 4 "reserved" 3 "level3" 2 "level2" 1 "level1" 0 "Unavailable";
++VAL_ 582 AEBPedtrnDspCmdHSC2 3 "reserved" 2 "on" 1 "off" 0 "unavailable";
++VAL_ 582 FCWrnngSts_RadarHSC2 7 "reserved" 6 "reserved" 5 "reserved" 4 "reserved" 3 "level 3" 2 "level 2" 1 "level 1" 0 "no request";
++VAL_ 582 FCWDspCmd_RadarHSC2 3 "reserved" 2 "on" 1 "off" 0 "unavailable";
++VAL_ 582 AEBDspCmd_RadarHSC2 3 "reserved" 2 "on" 1 "off" 0 "unavailable";
++VAL_ 588 BrkDiscTemStsHSC2 1 "Temperature too high" 0 "Not high" ;
++VAL_ 588 BrkPdlDrvrAppdPrsV_RadarHSC2 1 "Invalid" 0 "Valid" ;
++VAL_ 588 LDrvnWhlRotlDircnHSC2 3 "Initial/Invalid" 2 "Backward" 1 "Forward" 0 "Unknown" ;
++VAL_ 588 RDrvnWhlRotlDircnHSC2 3 "Initial/Invalid" 2 "Backward" 1 "Forward" 0 "Unknown" ;
++VAL_ 588 WhlBrkPrsStsHSC2 1 "No brake force" 0 "Exist brake force" ;
++VAL_ 588 WhlGndVelLDrvnV_RadarHSC2 1 "Invalid" 0 "Valid" ;
++VAL_ 588 WhlGndVelRDrvnV_RadarHSC2 1 "Invalid" 0 "Valid" ;
++VAL_ 593 ChACCAccReqRespHSC2 7 "reserved" 6 "reserved" 4 "pre-condition not satisfied" 3 "control not allowed for error" 2 "lost arbitration" 1 "request honored" 0 "no request" ;
++VAL_ 593 ChACCAEBBrkJerkReqRespHSC2 7 "reserve" 6 "reserve" 4 "pre-condition not satisfied" 3 "control not allowed for error" 2 "lost arbitration" 1 "request honored" 0 "no request" ;
++VAL_ 593 ChACCReqFlrStsHSC2 3 "not defined" 2 "irreversible error" 1 "reversible error" 0 "No error" ;
++VAL_ 593 ChAEBDclReqRespHSC2 7 "reserved" 6 "reserved" 4 "pre-condition not satisfied" 3 "control not allowed for error" 2 "lost arbitration" 1 "request honored" 0 "no request" ;
++VAL_ 593 ChAEBHydBrkAstReqRespHSC2 7 "reserve" 6 "reserve" 4 "pre-condition not satisfied" 3 "control not allowed for error" 2 "lost arbitration" 1 "request honored" 0 "no request" ;
++VAL_ 593 ChAEBPrflReqRespHSC2 7 "reserve" 6 "reserve" 4 "pre-condition not satisfied" 3 "control not allowed for error" 2 "lost arbitration" 1 "request honored" 0 "no request" ;
++VAL_ 593 VehSdslStsHSC2 3 "reserved" 2 "invalid (short unavailability, max 3s)" 1 "standstill" 0 "not standstill" ;
++VAL_ 851 VehSpdAvgDrvnVHSC2 1 "Invalid" 0 "Valid" ;
++VAL_ 851 VehSpdAvgNonDrvnVHSC2 1 "Invalid" 0 "Valid" ;
++VAL_ 1130 BntOpenStsHSC2 3 "Reserved" 2 "Bonnet Switch Disconnect" 1 "Bonnet Open" 0 "Bonnet Closed" ;
++VAL_ 1130 DipdBeamLghtOnHSC2 1 "True" 0 "False" ;
++VAL_ 1130 DircnIndLampSwStsHSC2 3 "reserve" 2 "Right on" 1 "Left on" 0 "off" ;
++VAL_ 1130 DrvrDoorOpenStsHSC2 3 "Driver Door Full Open" 2 "Driver Door Ajar" 1 "Driver Door Open(For latch switch can't detect door ajar status)" 0 "Driver Door Closed" ;
++VAL_ 1130 DspMeasSysHSC2 1 "mph" 0 "kph" ;
++VAL_ 1130 FrtFogLghtOnHSC2 1 "True" 0 "False" ;
++VAL_ 1130 FrtPsngDoorOpenStsHSC2 3 "Front Passenger Door Full Open" 2 "Front Passenger Door Ajar" 1 "Front Passenger Open(latch switch cann¡®t detect door ajar statu" 0 "Front Passenger Door Closed" ;
++VAL_ 1130 FrtWiperParkPosAHSC2 1 "True" 0 "False" ;
++VAL_ 1130 FrtWshrPumpAHSC2 1 "True" 0 "False" ;
++VAL_ 1130 KeyDetIndxHSC2 7 "error" 6 "key 6 is detected" 5 "key 5 is detected" 4 "key 4 is detected" 3 "key 3 is detected" 2 "key 2 is detected" 1 "key 1 is detected" 0 "non key is detected" ;
++VAL_ 1130 LDircnIndLghtFHSC2 1 "True" 0 "False" ;
++VAL_ 1130 LDircnIOHSC2 1 "True" 0 "False" ;
++VAL_ 1130 LdspcOpenStsHSC2 3 "Reserved" 2 "Reserved" 1 "Load Space Open" 0 "Load Space Closed" ;
++VAL_ 1130 MainBeamLghtOnHSC2 1 "True" 0 "False" ;
++VAL_ 1130 RDircnIndLghtFHSC2 1 "True" 0 "False" ;
++VAL_ 1130 RDircnIOHSC2 1 "True" 0 "False" ;
++VAL_ 1130 RLDoorOpenStsHSC2 3 "Rear Left Door Full Open" 2 "Rear Left Door Ajar" 1 "Rear Left Door Open(latch switch cann't detect door ajar status" 0 "Rear Left Door Closed" ;
++VAL_ 1130 RRDoorOpenStsHSC2 3 "Rear Right Door Full Open" 2 "Rear Right Door Ajar" 1 "Rear Right Door Open(latch switch cann't detect door ajar status" 0 "Rear Right Door Closed" ;
++VAL_ 1130 RrFogLghtOnHSC2 1 "True" 0 "False" ;
++VAL_ 1130 VehSideLghtStsHSC2 3 "All side light and license plate light on" 2 "Right side light on only" 1 "Left side light on only" 0 "No side light on " ;
+diff --git a/opendbc/dbc/tesla_can.dbc b/opendbc/dbc/tesla_can.dbc
+index 56624c3e..447231d5 100644
+--- a/opendbc/dbc/tesla_can.dbc
++++ b/opendbc/dbc/tesla_can.dbc
+@@ -63,6 +63,10 @@ VAL_TABLE_ DI_speedUnits 1 "DI_SPEED_KPH" 0 "DI_SPEED_MPH" ;
+ VAL_TABLE_ DI_state 4 "DI_STATE_ENABLE" 3 "DI_STATE_FAULT" 2 "DI_STATE_CLEAR_FAULT" 1 "DI_STATE_STANDBY" 0 "DI_STATE_PREAUTH" ;
+ VAL_TABLE_ DI_velocityEstimatorState 4 "VE_STATE_BACKUP_MOTOR" 3 "VE_STATE_BACKUP_WHEELS_B" 2 "VE_STATE_BACKUP_WHEELS_A" 1 "VE_STATE_WHEELS_NORMAL" 0 "VE_STATE_NOT_INITIALIZED" ;
+ 
++BO_ 637 APS_eacMonitor: 3 APS
++  SG_ APS_eacAllow : 0|2@1+ (1,0) [0|0] "" EPAS3P
++  SG_ APS_eacMonitorCounter : 8|4@1+ (1,0) [0|0] "" EPAS3P
++  SG_ APS_eacMonitorChecksum : 16|8@1+ (1,0) [0|0] "" EPAS3P
+ 
+ BO_ 1160 DAS_steeringControl: 4 NEO
+  SG_ DAS_steeringControlType : 23|2@0+ (1,0) [0|0] "" EPAS
+@@ -206,7 +210,7 @@ BO_ 309 ESP_135h: 5 ESP
+ BO_ 341 ESP_B: 8 ESP
+  SG_ ESP_BChecksum : 39|8@0+ (1,0) [0|255] ""  NEO,EPAS
+  SG_ ESP_BCounter : 62|4@0+ (1,0) [1|15] ""  NEO,EPAS
+- SG_ ESP_vehicleSpeed : 47|16@0+ (0.00999999978,0) [0|0] "kph"  NEO,EPAS
++ SG_ ESP_vehicleSpeed : 47|16@0+ (0.01,0) [0|0] "kph"  NEO,EPAS
+  SG_ ESP_vehicleSpeedQF : 57|2@0+ (1,0) [1|2] ""  NEO,EPAS
+  SG_ ESP_wheelPulseCountFrL : 7|8@0+ (1,0) [0|254] ""  NEO,EPAS
+  SG_ ESP_wheelPulseCountFrR : 15|8@0+ (1,0) [0|254] ""  NEO,EPAS
+@@ -663,6 +667,31 @@ BO_ 1064 UI_telemetryControl: 8 GTW
+ BO_ 522 BrakeMessage: 8 XXX
+  SG_ driverBrakeStatus : 2|2@1+ (1,0) [0|3] "" XXX
+ 
++BO_ 529 RCM_status: 8 RCM
++ SG_ RCM_driverOrientationInitStatus : 2|3@0+ (1,0) [0|7] "" GTW,OCS
++ SG_ RCM_armStatus : 5|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_warningIndicatorState : 7|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_tellTalePassengerState : 9|2@0+ (1,0) [0|3] "" GTW,OCS,DAS
++ SG_ RCM_bucklePassengerStatus : 11|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_tellTaleDriverState : 13|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_buckleDriverStatus : 15|2@0+ (1,0) [0|3] "" GTW,OCS,DAS
++ SG_ RCM_seatTrackPositionDrvr : 19|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_passAirbagRequest : 21|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_chimeState1stRow : 23|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_vinLearnFlag : 25|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_hwConfigPin58 : 27|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_hwConfigPin57 : 29|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_hwConfigPin56 : 31|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_passOccupantStatus : 33|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_airbagCutoffSwStatus : 35|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_privateCANStatus : 37|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_publicCANStatus : 39|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_edr2State : 45|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_edr1State : 47|2@0+ (1,0) [0|3] "" GTW,OCS
++ SG_ RCM_buckle2ndRowStatus : 50|3@0+ (1,0) [0|3] "" GTW,OCS,DAS
++ SG_ RCM_statusCounter : 55|4@0+ (1,0) [0|15] "" GTW,OCS,DAS
++ SG_ RCM_statusChecksum : 63|8@0+ (1,0) [0|255] "" GTW,OCS,DAS
++
+ BO_ 921 AutopilotStatus: 8 XXX
+  SG_ autopilotStatus : 0|4@1+ (1,0) [0|0] "" XXX
+  SG_ DAS_blindSpotRearLeft : 4|2@1+ (1,0) [0|0] "" XXX
+@@ -794,6 +823,7 @@ VAL_ 521 DAS_locSpeed 2047 "SNA" ;
+ VAL_ 521 DAS_locAccelMin 511 "SNA" ;
+ VAL_ 521 DAS_locAccelMax 511 "SNA" ;
+ VAL_ 522 driverBrakeStatus 2 "APPLIED" 1 "NOT_APPLIED" ;
++VAL_ 637 APS_eacAllow 3 "APS_EAC_SNA" 2 "APS_EAC_RESERVED" 1 "APS_EAC_ALLOW" 0 "APS_EAC_INHIBIT" ;
+ VAL_ 760 UI_mapSpeedLimitUnits 1 "KPH" 0 "MPH" ;
+ VAL_ 760 UI_userSpeedOffsetUnits 1 "KPH" 0 "MPH" ;
+ VAL_ 643 AirTemp_Insd 255 "SNA" ;
+@@ -895,7 +925,7 @@ VAL_ 1001 DAS_highLowBeamDecision 3 "DAS_HIGH_BEAM_SNA" 2 "DAS_HIGH_BEAM_ON" 1 "
+ VAL_ 1001 DAS_highLowBeamOffReason 5 "HIGH_BEAM_OFF_REASON_SNA" 4 "HIGH_BEAM_OFF_REASON_HEAD_LIGHT" 3 "HIGH_BEAM_OFF_REASON_AMBIENT_LIGHT" 2 "HIGH_BEAM_OFF_REASON_MOVING_RADAR_TARGET" 1 "HIGH_BEAM_OFF_REASON_MOVING_VISION_TARGET" 0 "HIGH_BEAM_ON" ;
+ VAL_ 1001 DAS_turnIndicatorRequestReason 6 "DAS_ACTIVE_COMMANDED_LANE_CHANGE" 5 "DAS_CANCEL_FORK" 4 "DAS_CANCEL_LANE_CHANGE" 3 "DAS_ACTIVE_FORK" 2 "DAS_ACTIVE_SPEED_LANE_CHANGE" 1 "DAS_ACTIVE_NAV_LANE_CHANGE" 0 "DAS_NONE" ;
+ VAL_ 1160 DAS_steeringAngleRequest 16384 "ZERO_ANGLE" ;
+-VAL_ 1160 DAS_steeringControlType 1 "ANGLE_CONTROL" 3 "DISABLED" 0 "NONE" 2 "RESERVED" ;
++VAL_ 1160 DAS_steeringControlType 2 "LANE_KEEP_ASSIST" 0 "NONE" 1 "ANGLE_CONTROL" 3 "EMERGENCY_LANE_KEEP" ;
+ VAL_ 1160 DAS_steeringHapticRequest 1 "ACTIVE" 0 "IDLE" ;
+ 
+ 
+diff --git a/opendbc/dbc/tesla_raven_party.dbc b/opendbc/dbc/tesla_raven_party.dbc
+new file mode 100644
+index 00000000..40ac48cc
+--- /dev/null
++++ b/opendbc/dbc/tesla_raven_party.dbc
+@@ -0,0 +1,115 @@
++VERSION ""
++
++
++NS_ :
++	NS_DESC_
++	CM_
++	BA_DEF_
++	BA_
++	VAL_
++	CAT_DEF_
++	CAT_
++	FILTER
++	BA_DEF_DEF_
++	EV_DATA_
++	ENVVAR_DATA_
++	SGTYPE_
++	SGTYPE_VAL_
++	BA_DEF_SGTYPE_
++	BA_SGTYPE_
++	SIG_TYPE_REF_
++	VAL_TABLE_
++	SIG_GROUP_
++	SIG_VALTYPE_
++	SIGTYPE_VALTYPE_
++	BO_TX_BU_
++	BA_DEF_REL_
++	BA_REL_
++	BA_DEF_DEF_REL_
++	BU_SG_REL_
++	BU_EV_REL_
++	BU_BO_REL_
++	SG_MUL_VAL_
++
++BS_:
++
++BU_: IBST ESP EPAS EPAS3P APS APP DAS
++
++BO_ 14 STW_ANGLHP_STAT: 8 APS
++  SG_ StW_AnglHP : 5|14@0+ (0.1,-819.2) [-819.2|819] "deg" EPAS3P
++  SG_ StW_AnglHP_Spd : 21|14@0+ (0.5,-4096) [-4096|4095.5] "deg/s" EPAS3P
++  SG_ StW_AnglHP_Sens_Stat : 33|2@0+ (1,0) [0|0] "" EPAS3P
++  SG_ StW_AnglHP_Sens_Id : 35|2@0+ (1,0) [0|0] "" EPAS3P
++  SG_ MC_STW_ANGLHP_STAT : 55|4@0+ (1,0) [0|15] "" EPAS3P
++  SG_ CRC_STW_ANGLHP_STAT : 63|8@0+ (1,0) [0|0] "" EPAS3P
++
++BO_ 637 APS_eacMonitor: 3 APS
++  SG_ APS_eacAllow : 0|2@1+ (1,0) [0|0] "" EPAS3P
++  SG_ APS_eacMonitorCounter : 8|4@1+ (1,0) [0|0] "" EPAS3P
++  SG_ APS_eacMonitorChecksum : 16|8@1+ (1,0) [0|0] "" EPAS3P
++
++BO_ 880 EPAS_sysStatus: 8 EPAS
++  SG_ EPAS_steeringRackForce : 1|10@0+ (50,-25575) [-25575|25575] "N" Vector__XXX
++  SG_ EPAS_steeringFault : 2|1@0+ (1,0) [0|1] "" APS,APP
++  SG_ EPAS_steeringReduced : 3|1@0+ (1,0) [0|1] "" APS,APP
++  SG_ EPAS_currentTuneMode : 7|4@0+ (1,0) [0|0] "" APS,APP
++  SG_ EPAS_torsionBarTorque : 19|12@0+ (0.01,-20.5) [-20.5|20.45] "Nm" APS,APP
++  SG_ EPAS_eacErrorCode : 23|4@0+ (1,0) [0|15] "" APS,APP
++  SG_ EPAS_internalSAS : 37|14@0+ (0.1,-819.2) [-819.2|819] "deg" APS,APP
++  SG_ EPAS_handsOnLevel : 39|2@0+ (1,0) [0|3] "" APS,APP
++  SG_ EPAS_sysStatusCounter : 51|4@0+ (1,0) [0|15] "" APS,APP
++  SG_ EPAS_eacStatus : 55|3@0+ (1,0) [0|7] "" APS,APP
++  SG_ EPAS_sysStatusChecksum : 63|8@0+ (1,0) [0|255] "" APS,APP
++
++BO_ 907 ESP_private1: 8 ESP
++  SG_ ESP_private1Checksum : 0|8@1+ (1,0) [0|255] "" IBST,EPAS
++  SG_ ESP_private1Counter : 8|4@1+ (1,0) [0|15] "" IBST,EPAS
++  SG_ ESP_pEstMax : 16|8@1+ (1,0) [0|250] "bar" IBST
++  SG_ ESP_pEstMaxQF : 24|2@1+ (1,0) [0|2] "" IBST
++  SG_ ESP_vehicleSpeed : 26|14@1+ (0.05625,0) [0|921.54375] "km/h" IBST,EPAS
++  SG_ ESP_vehicleSpeedQF : 40|3@1+ (1,0) [0|6] "" IBST,EPAS
++  SG_ ESP_ignitionOn : 43|1@1+ (1,0) [0|1] "" IBST
++
++BO_ 911 IBST_private2: 8 IBST
++  SG_ IBST_private2Checksum : 0|8@1+ (1,0) [0|255] "" ESP
++  SG_ IBST_private2Counter : 8|4@1+ (1,0) [0|15] "" ESP
++  SG_ IBST_pForceBlendingPotentialQF : 12|2@1+ (1,0) [0|2] "" ESP
++  SG_ IBST_brakePedalApplied : 16|1@1+ (1,0) [0|1] "1" ESP
++  SG_ IBST_brakePedalAppliedQF : 17|2@1+ (1,0) [0|3] "" ESP
++  SG_ IBST_status : 19|3@1+ (1,0) [0|7] "1" ESP
++  SG_ IBST_pRunout : 22|8@1+ (1,0) [0|250] "bar" ESP
++  SG_ IBST_pRunoutQF : 30|2@1+ (1,0) [0|3] "" ESP
++  SG_ IBST_compatibilityIndex : 32|4@1+ (1,0) [0|15] "" ESP
++  SG_ IBST_pForceBlendingPotential : 40|8@1+ (0.5,0) [0|125] "bar" ESP
++
++BO_ 1160 DAS_steeringControl: 4 DAS
++  SG_ DAS_steeringAngleRequest : 6|15@0+ (0.1,-1638.35) [-1638.35|1638.35] "deg" EPAS3P,APS
++  SG_ DAS_steeringHapticRequest : 7|1@0+ (1,0) [0|0] "" EPAS3P,APS
++  SG_ DAS_steeringControlCounter : 19|4@0+ (1,0) [0|0] "" EPAS3P,APS
++  SG_ DAS_steeringControlType : 23|2@0+ (1,0) [0|0] "" EPAS3P,APS
++  SG_ DAS_steeringControlChecksum : 31|8@0+ (1,0) [0|0] "" EPAS3P,APS
++
++VAL_ 14 StW_AnglHP 16383 "SNA" ;
++VAL_ 14 StW_AnglHP_Spd 16383 "SNA" ;
++VAL_ 14 StW_AnglHP_Sens_Stat 3 "SNA" 2 "ERR" 1 "INI" 0 "OK" ;
++VAL_ 14 StW_AnglHP_Sens_Id 3 "SNA" 2 "KOSTAL" 1 "DELPHI" 0 "TEST" ;
++VAL_ 637 APS_eacAllow 3 "APS_EAC_SNA" 2 "APS_EAC_RESERVED" 1 "APS_EAC_ALLOW" 0 "APS_EAC_INHIBIT" ;
++VAL_ 880 EPAS_steeringRackForce 1023 "SNA" 1022 "NOT_IN_SPEC" ;
++VAL_ 880 EPAS_steeringFault 1 "FAULT" 0 "NO_FAULT" ;
++VAL_ 880 EPAS_steeringReduced 1 "REDUCED_ASSIST" 0 "NORMAL_ASSIST" ;
++VAL_ 880 EPAS_currentTuneMode 7 "UNAVAILABLE" 6 "RWD_SPORT" 5 "RWD_STANDARD" 4 "RWD_COMFORT" 3 "DM_SPORT" 2 "DM_STANDARD" 1 "DM_COMFORT" 0 "FAIL_SAFE_DEFAULT" ;
++VAL_ 880 EPAS_torsionBarTorque 4095 "SNA" 4094 "UNDEFINABLE_DATA" ;
++VAL_ 880 EPAS_eacErrorCode 15 "SNA" 14 "EAC_EXTERNAL_MONITOR_INHIBIT" 13 "EAC_ERROR_PINION_VEL_DIFF" 12 "EAC_ERROR_LOW_ASSIST" 11 "EAC_ERROR_HIGH_TORSION_SAFETY" 10 "EAC_ERROR_HIGH_MMOT_SAFETY" 9 "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY" 8 "EAC_ERROR_HIGH_ANGLE_SAFETY" 7 "EAC_ERROR_HIGH_ANGLE_RATE_REQ" 6 "EAC_ERROR_HIGH_ANGLE_REQ" 5 "EAR_ERROR_MAX_STEER_DELTA" 4 "EAC_ERROR_TMP_FAULT" 3 "EAC_ERROR_HANDS_ON" 2 "EAC_ERROR_MAX_SPEED" 1 "EAC_ERROR_MIN_SPEED" 0 "EAC_ERROR_IDLE" ;
++VAL_ 880 EPAS_handsOnLevel 3 "LEVEL_3" 2 "LEVEL_2" 1 "LEVEL_1" 0 "LEVEL_0" ;
++VAL_ 880 EPAS_eacStatus 7 "EAC_ELK_ACTIVE" 6 "EAC_ELK_AVAILABLE" 5 "EAC_LKA_ACTIVE" 4 "EAC_LKA_ELK_AVAILABLE" 3 "EAC_FAULT" 2 "EAC_ACTIVE" 1 "EAC_AVAILABLE" 0 "EAC_INHIBITED" ;
++VAL_ 907 ESP_pEstMaxQF 2 "PESTMAX_FAULT" 1 "PESTMAX_NORMAL" 0 "PESTMAX_NOT_INITIALIZED" ;
++VAL_ 907 ESP_vehicleSpeedQF 6 "SPEED_INV_UNDER_V" 5 "SPEED_NOT_CALC" 4 "SPEED_REDUCED_MON" 3 "SPEED_DIFF_CALC" 2 "SPEED_FAULT" 1 "SPEED_NORMAL" 0 "SPEED_NOT_INITIALIZED" ;
++VAL_ 907 ESP_ignitionOn 1 "ESP_IGNITION_ON" 0 "ESP_IGNITION_OFF" ;
++VAL_ 911 IBST_pForceBlendingPotentialQF 2 "BLENDING_POTENTIAL_FAULT" 1 "BLENDING_POTENTIAL_NORMAL" 0 "BLENDING_POTENTIAL_NOT_INIT" ;
++VAL_ 911 IBST_brakePedalApplied 1 "BRAKE_PEDAL_APPLIED" 0 "BRAKE_PEDAL_NOT_APPLIED" ;
++VAL_ 911 IBST_brakePedalAppliedQF 2 "BRAKE_PEDAL_APPLIED_FAULT" 1 "BRAKE_PEDAL_APPLIED_NORMAL" 0 "BRAKE_PEDAL_APPLIED_OFF" ;
++VAL_ 911 IBST_status 7 "IBOOSTER_READY" 6 "IBOOSTER_POST_RUN_REDUCED" 5 "IBOOSTER_REDUCED" 4 "IBOOSTER_STANDALONE" 3 "IBOOSTER_UNDEFINED_1" 2 "IBOOSTER_DIAGNOSTIC" 1 "IBOOSTER_FAULT" 0 "IBOOSTER_NOT_INITIALIZED" ;
++VAL_ 911 IBST_pRunoutQF 2 "RUNNOUT_FAULT" 1 "RUNNOUT_NORMAL" 0 "RUNNOUT_NOT_INITIALIZED" ;
++VAL_ 1160 DAS_steeringAngleRequest 16384 "ZERO_ANGLE" ;
++VAL_ 1160 DAS_steeringHapticRequest 1 "HAPTIC_ACTIVE" 0 "HAPTIC_IDLE" ;
++VAL_ 1160 DAS_steeringControlType 3 "EMERGENCY_LANE_KEEP" 2 "LANE_KEEP_ASSIST" 1 "ANGLE_CONTROL" 0 "NONE" ;
+\ No newline at end of file
+diff --git a/opendbc/safety/declarations.h b/opendbc/safety/declarations.h
+index 1a685494..dfaae8af 100644
+--- a/opendbc/safety/declarations.h
++++ b/opendbc/safety/declarations.h
+@@ -34,6 +34,8 @@
+ #define SAFETY_PSA 31U
+ #define SAFETY_RIVIAN 33U
+ #define SAFETY_VOLKSWAGEN_MEB 34U
++#define SAFETY_MG 35U
++#define SAFETY_TESLA_LEGACY 36U
+ 
+ #define GET_BIT(msg, b) ((bool)!!(((msg)->data[((b) / 8U)] >> ((b) % 8U)) & 0x1U))
+ #define GET_FLAG(value, mask) (((value) & (mask)) == (mask))
+diff --git a/opendbc/safety/modes/mg.h b/opendbc/safety/modes/mg.h
+new file mode 100644
+index 00000000..01e19af4
+--- /dev/null
++++ b/opendbc/safety/modes/mg.h
+@@ -0,0 +1,98 @@
++#pragma once
++
++#include "opendbc/safety/declarations.h"
++
++static bool mg_zs_ev_brake = false;
++
++static void mg_rx_hook(const CANPacket_t *msg) {
++  if (msg->bus == 0U)  {
++    // Vehicle speed
++    if (msg->addr == 0x23cU) {
++      float speed = (((msg->data[2] & 0x7FU) << 8) | msg->data[3]) * 0.015625;
++      vehicle_moving = speed > 0.0;
++      UPDATE_VEHICLE_SPEED(speed * KPH_TO_MS);
++    }
++
++    // Gas pressed
++    if (msg->addr == 0xafU) {
++      gas_pressed = msg->data[0] != 0U;
++    }
++
++    // Driver torque
++    if (msg->addr == 0x1ecU) {
++      int torque_driver_new = (((msg->data[4] & 0x7U) << 8) | msg->data[5]) - 1024U;
++      update_sample(&torque_driver, torque_driver_new);
++    }
++
++    // Brake pressed
++    if (mg_zs_ev_brake) {
++      if (msg->addr == 0xafU) {
++        brake_pressed = GET_BIT(msg, 31U);
++      }
++    } else {
++      if (msg->addr == 0x1b6U) {
++        brake_pressed = GET_BIT(msg, 10U);
++      }
++    }
++
++    // Cruise state
++    if (msg->addr == 0x242U) {
++      int cruise_state = (msg->data[5] & 0x38U) >> 3;
++      bool cruise_engaged = (cruise_state == 2) ||  // Active
++                            (cruise_state == 3);    // Override
++      pcm_cruise_check(cruise_engaged);
++    }
++  }
++}
++
++static bool mg_tx_hook(const CANPacket_t *msg) {
++  const TorqueSteeringLimits MG_STEERING_LIMITS = {
++    .max_torque = 300,
++    .max_rate_up = 10,
++    .max_rate_down = 15,
++    .max_rt_delta = 125,
++    .driver_torque_multiplier = 2,
++    .driver_torque_allowance = 100,
++    .type = TorqueDriverLimited,
++  };
++
++  bool tx = true;
++  bool violation = false;
++
++  // Steering control
++  if (msg->addr == 0x1fdU) {
++    int desired_torque = (((msg->data[0] & 0x7U) << 8) | msg->data[1]) - 1024U;
++    bool steer_req = GET_BIT(msg, 35U);
++
++    violation |= steer_torque_cmd_checks(desired_torque, steer_req, MG_STEERING_LIMITS);
++  }
++
++  if (violation) {
++    tx = false;
++  }
++
++  return tx;
++}
++
++static safety_config mg_init(uint16_t param) {
++  static const CanMsg MG_TX_MSGS[] = {{0x1fd, 0, 8, .check_relay = true}};
++
++  static RxCheck mg_rx_checks[] = {
++    {.msg = {{0x23c, 0, 8, .frequency = 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},   // SCS_HSC2_FrP19 (speed)
++    {.msg = {{0xaf, 0, 8, .frequency = 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},   // GW_HSC2_HCU_FrP00 (gas pedal)
++    {.msg = {{0x1b6, 0, 8, .frequency = 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},   // EHBS_HSC2_FrP00 (brake pedal)
++    {.msg = {{0x1ec, 0, 8, .frequency = 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},   // EPS_HSC2_FrP03 (driver torque)
++    {.msg = {{0x242, 0, 8, .frequency = 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},   // RADAR_HSC2_FrP00 (cruise state)
++  };
++
++  const uint16_t MG_PARAM_ALT_BRAKE = 2;
++  mg_zs_ev_brake = GET_FLAG(param, MG_PARAM_ALT_BRAKE);
++
++  return BUILD_SAFETY_CFG(mg_rx_checks, MG_TX_MSGS);
++}
++
++const safety_hooks mg_hooks = {
++  .init = mg_init,
++  .rx = mg_rx_hook,
++  .tx = mg_tx_hook,
++};
+diff --git a/opendbc/safety/modes/tesla_legacy.h b/opendbc/safety/modes/tesla_legacy.h
+new file mode 100644
+index 00000000..7668f9b7
+--- /dev/null
++++ b/opendbc/safety/modes/tesla_legacy.h
+@@ -0,0 +1,291 @@
++#pragma once
++
++#include "opendbc/safety/declarations.h"
++
++static bool tesla_external_panda = false;
++static bool tesla_hw1 = false;
++static bool tesla_hw2 = false;
++static bool tesla_hw3 = false;
++
++static int chassis_bus = 0U;
++static int das_control_msg = 0x2bfU;
++static int di_torque1_msg = 0x106U;
++
++static bool tesla_legacy_stock_aeb = false;
++
++// Only rising edges while controls are not allowed are considered for these systems:
++// TODO: Only LKAS (non-emergency) is currently supported since we've only seen it
++static bool tesla_legacy_stock_lkas = false;
++static bool tesla_legacy_stock_lkas_prev = false;
++
++static void tesla_legacy_rx_hook(const CANPacket_t *msg) {
++
++  // Steering angle: (0.1 * val) - 819.2 in deg.
++  if (!tesla_external_panda && (msg->bus == 0U) && (msg->addr == 0x370U)) {
++    // Store it 1/10 deg to match steering request
++    const int angle_meas_new = (((msg->data[4] & 0x3FU) << 8) | msg->data[5]) - 8192U;
++    update_sample(&angle_meas, angle_meas_new);
++
++    const int hands_on_level = msg->data[4] >> 6;  // handsOnLevel
++    const int eac_status = msg->data[6] >> 5;      // eacStatus
++    const int eac_error_code = msg->data[2] >> 4;  // eacErrorCode
++
++    // Disengage on normal user override, or if high angle rate fault from user overriding extremely quickly
++    steering_disengage = (hands_on_level >= 3) || ((eac_status == 0) && (eac_error_code == 9));
++  }
++
++  // Vehicle speed (ESP_B: ESP_vehicleSpeed)
++  if ((!tesla_external_panda) && (msg->bus == chassis_bus) && (msg->addr == 0x155U)) {
++    // Vehicle speed: (0.01 * val) * KPH_TO_MS
++    float speed = ((msg->data[6] | (msg->data[5] << 8)) * 0.01) * KPH_TO_MS;
++    UPDATE_VEHICLE_SPEED(speed);
++  }
++
++  // Gas pressed
++  if ((tesla_external_panda || tesla_hw1) && (msg->bus == 0U) && (msg->addr == di_torque1_msg)) {
++    gas_pressed = msg->data[6] != 0U;
++  }
++
++  if (((tesla_external_panda) && (msg->bus == 0U) && (msg->addr == 0x1f8U)) ||
++     ((!tesla_external_panda) && (msg->bus == chassis_bus) && (msg->addr == 0x20aU))) {
++    brake_pressed = (((msg->data[0] & 0x0CU) >> 2) != 1U);
++  }
++
++  // Cruise
++  if (((tesla_external_panda) && (msg->bus == 0U) && (msg->addr == 0x256U)) ||
++     ((!tesla_external_panda) && (msg->bus == chassis_bus) && (msg->addr == 0x368U))) {
++      // Cruise state
++      int cruise_state = (msg->data[1] >> 4) & 0x07U;
++      bool cruise_engaged = (cruise_state == 2) ||  // ENABLED
++                            (cruise_state == 3) ||  // STANDSTILL
++                            (cruise_state == 4) ||  // OVERRIDE
++                            (cruise_state == 6) ||  // PRE_FAULT
++                            (cruise_state == 7);    // PRE_CANCEL
++      vehicle_moving = cruise_state != 3; // STANDSTILL
++      pcm_cruise_check(cruise_engaged);
++   }
++
++  if (msg->bus == 2U) {
++    // DAS_control
++    if ((tesla_external_panda || tesla_hw1) && msg->addr == das_control_msg) {
++      // "AEB_ACTIVE"
++      tesla_legacy_stock_aeb = (msg->data[2] & 0x03U) == 1U;
++    }
++
++    // DAS_steeringControl
++    if (!tesla_external_panda && msg->addr == 0x488U) {
++      int steering_control_type = msg->data[2] >> 6;
++      bool tesla_legacy_stock_lkas_now = steering_control_type == 2;  // "LANE_KEEP_ASSIST"
++
++      // Only consider rising edges while controls are not allowed
++      if (tesla_legacy_stock_lkas_now && !tesla_legacy_stock_lkas_prev && !controls_allowed) {
++        tesla_legacy_stock_lkas = true;
++      }
++      if (!tesla_legacy_stock_lkas_now) {
++        tesla_legacy_stock_lkas = false;
++      }
++      tesla_legacy_stock_lkas_prev = tesla_legacy_stock_lkas_now;
++    }
++  }
++}
++
++
++static bool tesla_legacy_tx_hook(const CANPacket_t *msg) {
++  const AngleSteeringLimits TESLA_STEERING_LIMITS = {
++    .max_angle = 3600,  // 360 deg, EPAS faults above this
++    .angle_deg_to_can = 10,
++    .frequency = 50U,
++  };
++
++  // NOTE: based off TESLA_MODEL_S_HW3 to match openpilot
++  const AngleSteeringParams TESLA_LEGACY_STEERING_PARAMS = {
++    .slip_factor = -0.0005666493436310427,  // calc_slip_factor(VM)
++    .steer_ratio = 15.,
++    .wheelbase = 2.96,
++  };
++
++  const LongitudinalLimits TESLA_LONG_LIMITS = {
++    .max_accel = 425,       // 2 m/s^2
++    .min_accel = 288,       // -3.48 m/s^2
++    .inactive_accel = 375,  // 0. m/s^2
++  };
++
++  bool tx = true;
++  bool violation = false;
++
++  // Steering control: (0.1 * val) - 1638.35 in deg.
++  if (!tesla_external_panda && (msg->addr == 0x488U)) {
++    // We use 1/10 deg as a unit here
++    int raw_angle_can = ((msg->data[0] & 0x7FU) << 8) | msg->data[1];
++    int desired_angle = raw_angle_can - 16384;
++    int steer_control_type = msg->data[2] >> 6;
++    bool steer_control_enabled = steer_control_type == 1;  // ANGLE_CONTROL
++
++    if (steer_angle_cmd_checks_vm(desired_angle, steer_control_enabled, TESLA_STEERING_LIMITS, TESLA_LEGACY_STEERING_PARAMS)) {
++      violation = true;
++    }
++
++    bool valid_steer_control_type = (steer_control_type == 0) ||  // NONE
++                                    (steer_control_type == 1);    // ANGLE_CONTROL
++    if (!valid_steer_control_type) {
++      violation = true;
++    }
++
++    if (tesla_legacy_stock_lkas) {
++      // Don't allow any steering commands when stock LKAS is active
++      violation = true;
++    }
++  }
++
++  // DAS_control: longitudinal control message
++  if ((tesla_external_panda || tesla_hw1) && (msg->addr == das_control_msg)) {
++    // No AEB events may be sent by openpilot
++    int aeb_event = msg->data[2] & 0x03U;
++    if (aeb_event != 0) {
++      violation = true;
++    }
++
++    // Don't send long/cancel messages when the stock AEB system is active
++    if (tesla_legacy_stock_aeb) {
++      violation = true;
++    }
++
++    int raw_accel_max = ((msg->data[6] & 0x1FU) << 4) | (msg->data[5] >> 4);
++    int raw_accel_min = ((msg->data[5] & 0x0FU) << 5) | (msg->data[4] >> 3);
++
++    // Prevent both acceleration from being negative, as this could cause the car to reverse after coming to standstill
++    if ((raw_accel_max < TESLA_LONG_LIMITS.inactive_accel) && (raw_accel_min < TESLA_LONG_LIMITS.inactive_accel)) {
++      violation = true;
++    }
++
++    // Don't allow any acceleration limits above the safety limits
++    violation |= longitudinal_accel_checks(raw_accel_max, TESLA_LONG_LIMITS);
++    violation |= longitudinal_accel_checks(raw_accel_min, TESLA_LONG_LIMITS);
++  }
++
++  if (violation) {
++    tx = false;
++  }
++
++  return tx;
++}
++
++static bool tesla_legacy_fwd_hook(int bus_num, int addr) {
++  bool block_msg = false;
++
++  if (bus_num == 2) {
++    // APS_eacMonitor
++    if (!tesla_external_panda && !tesla_hw1 && (addr == 0x27dU)) {
++      block_msg = true;
++    }
++
++    // DAS_steeringControl
++    if (!tesla_external_panda && (addr == 0x488U) && !tesla_legacy_stock_lkas) {
++      block_msg = true;
++    }
++
++    // DAS_control
++    if ((tesla_external_panda || tesla_hw1) && (addr == das_control_msg) && !tesla_legacy_stock_aeb) {
++      block_msg = true;
++    }
++  }
++
++  return block_msg;
++}
++
++static safety_config tesla_legacy_init(uint16_t param) {
++  const int TESLA_FLAG_EXTERNAL_PANDA = 4;
++  const int TESLA_FLAG_HW1 = 8;
++  const int TESLA_FLAG_HW2 = 16;
++  const int TESLA_FLAG_HW3 = 32;
++
++  // Extract flags
++  tesla_external_panda = GET_FLAG(param, TESLA_FLAG_EXTERNAL_PANDA);
++  tesla_hw1 = GET_FLAG(param, TESLA_FLAG_HW1);
++  tesla_hw2 = GET_FLAG(param, TESLA_FLAG_HW2);
++  tesla_hw3 = GET_FLAG(param, TESLA_FLAG_HW3);
++
++  // Initialize state variables
++  tesla_legacy_stock_aeb = false;
++  tesla_legacy_stock_lkas = false;
++  tesla_legacy_stock_lkas_prev = false;
++  chassis_bus = 0U;
++  di_torque1_msg = 0x106U;
++
++  // Set DAS control message address
++  das_control_msg = tesla_external_panda ? 0x2bfU : 0x2b9U;
++
++  // Define message arrays (keeping them as is)
++  static const CanMsg TESLA_TX_LEGACY_MSGS[] = {
++    {0x488, 0, 4, .check_relay = true, .disable_static_blocking = true},  // DAS_steeringControl
++    {0x27D, 0, 3, .check_relay = true, .disable_static_blocking = true},  // APS_eacMonitor
++  };
++
++  static const CanMsg TESLA_LEGACY_PT_MSGS[] = {
++    {0x2bf, 0, 8, .check_relay = true, .disable_static_blocking = true},  // DAS_control
++  };
++
++  static const CanMsg TESLA_TX_LEGACY_HW1_MSGS[] = {
++    {0x488, 0, 4, .check_relay = true, .disable_static_blocking = true},  // DAS_steeringControl
++    {0x2b9, 0, 8, .check_relay = true, .disable_static_blocking = true},  // DAS_control
++  };
++
++  // Define RX check arrays (keeping them as is)
++  static RxCheck tesla_legacy_pt_rx_checks[] = {
++    {.msg = {{0x106, 0, 8, 100U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},  // DI_torque1
++    {.msg = {{0x1f8, 0, 8, 50U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // BrakeMessage
++    {.msg = {{0x2bf, 2, 8, 25U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // DAS_control
++    {.msg = {{0x256, 0, 8, 10U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // DI_state
++  };
++
++  static RxCheck tesla_legacy_hw1_rx_checks[] = {
++    {.msg = {{0x108, 0, 8, 100U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},  // DI_torque1
++    {.msg = {{0x2b9, 2, 8, 25U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // DAS_control
++    {.msg = {{0x370, 0, 8, 25U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // EPAS_sysStatus (25hz)
++    {.msg = {{0x155, 0, 8, 50U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // ESP_private1
++    {.msg = {{0x20a, 0, 8, 50U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // BrakeMessage
++    {.msg = {{0x368, 0, 8, 10U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // DI_state
++    {.msg = {{0x488, 2, 4, 50U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // DAS_steeringControl
++  };
++
++  static RxCheck tesla_legacy_hw2_rx_checks[] = {
++    {.msg = {{0x370, 0, 8, 25U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // EPAS_sysStatus (25hz)
++    {.msg = {{0x155, 0, 8, 50U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // ESP_private1
++    {.msg = {{0x20a, 0, 8, 50U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // BrakeMessage
++    {.msg = {{0x368, 0, 8, 10U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // DI_state
++    {.msg = {{0x488, 2, 4, 50U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // DAS_steeringControl
++  };
++
++  static RxCheck tesla_legacy_hw3_rx_checks[] = {
++    {.msg = {{0x370, 0, 8, 100U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // EPAS_sysStatus (100hz)
++    {.msg = {{0x155, 1, 8, 50U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // ESP_private1
++    {.msg = {{0x20a, 1, 8, 50U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // BrakeMessage
++    {.msg = {{0x368, 1, 8, 10U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // DI_state
++    {.msg = {{0x488, 2, 4, 50U, .ignore_quality_flag = true, .ignore_checksum = true, .ignore_counter = true}, { 0 }, { 0 }}},   // DAS_steeringControl
++  };
++
++  // Determine configuration based on hardware type
++  if (tesla_external_panda && (tesla_hw3 || tesla_hw2)) {
++    return BUILD_SAFETY_CFG(tesla_legacy_pt_rx_checks, TESLA_LEGACY_PT_MSGS);
++  }
++
++  if (tesla_hw3) {
++    chassis_bus = 1U;
++    return BUILD_SAFETY_CFG(tesla_legacy_hw3_rx_checks, TESLA_TX_LEGACY_MSGS);
++  }
++
++  if (tesla_hw1) {
++    di_torque1_msg = 0x108U;
++    return BUILD_SAFETY_CFG(tesla_legacy_hw1_rx_checks, TESLA_TX_LEGACY_HW1_MSGS);
++  }
++
++  // Default case: HW2
++  return BUILD_SAFETY_CFG(tesla_legacy_hw2_rx_checks, TESLA_TX_LEGACY_MSGS);
++}
++
++const safety_hooks tesla_legacy_hooks = {
++  .init = tesla_legacy_init,
++  .rx = tesla_legacy_rx_hook,
++  .tx = tesla_legacy_tx_hook,
++  .fwd = tesla_legacy_fwd_hook,
++};
+diff --git a/opendbc/safety/safety.h b/opendbc/safety/safety.h
+index 6417881d..ce4605cb 100644
+--- a/opendbc/safety/safety.h
++++ b/opendbc/safety/safety.h
+@@ -11,12 +11,14 @@
+ #include "opendbc/safety/modes/honda.h"
+ #include "opendbc/safety/modes/toyota.h"
+ #include "opendbc/safety/modes/tesla.h"
++#include "opendbc/safety/modes/tesla_legacy.h"
+ #include "opendbc/safety/modes/gm.h"
+ #include "opendbc/safety/modes/ford.h"
+ #include "opendbc/safety/modes/hyundai.h"
+ #include "opendbc/safety/modes/chrysler.h"
+ #include "opendbc/safety/modes/chrysler_cusw.h"
+ #include "opendbc/safety/modes/rivian.h"
++#include "opendbc/safety/modes/mg.h"
+ #include "opendbc/safety/modes/subaru.h"
+ #include "opendbc/safety/modes/subaru_preglobal.h"
+ #include "opendbc/safety/modes/mazda.h"
+@@ -403,6 +405,8 @@ int set_safety_hooks(uint16_t mode, uint16_t param) {
+     {SAFETY_FORD, &ford_hooks},
+     {SAFETY_RIVIAN, &rivian_hooks},
+     {SAFETY_TESLA, &tesla_hooks},
++    {SAFETY_MG, &mg_hooks},
++    {SAFETY_TESLA_LEGACY, &tesla_legacy_hooks},
+     {SAFETY_HYUNDAI_CANFD, &hyundai_canfd_hooks},
+ #ifdef ALLOW_DEBUG
+     {SAFETY_CHRYSLER_CUSW, &chrysler_cusw_hooks},
+diff --git a/opendbc/safety/tests/test_mg.py b/opendbc/safety/tests/test_mg.py
+new file mode 100755
+index 00000000..a2233d05
+--- /dev/null
++++ b/opendbc/safety/tests/test_mg.py
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++import unittest
++
++from opendbc.car.structs import CarParams
++from opendbc.safety.tests.libsafety import libsafety_py
++import opendbc.safety.tests.common as common
++from opendbc.safety.tests.common import CANPackerSafety
++
++
++class TestMGSafety(common.PandaCarSafetyTest, common.DriverTorqueSteeringSafetyTest):
++
++  TX_MSGS = [[0x1fd, 0], ]
++  RELAY_MALFUNCTION_ADDRS = {0: (0x1fd,)}
++  FWD_BLACKLISTED_ADDRS = {2: [0x1fd,]}
++
++  MAX_RATE_UP = 10
++  MAX_RATE_DOWN = 15
++  MAX_TORQUE_LOOKUP = [0], [300]
++  MAX_RT_DELTA = 125
++
++  DRIVER_TORQUE_ALLOWANCE = 100
++  DRIVER_TORQUE_FACTOR = 2
++
++  def setUp(self):
++    self.packer = CANPackerSafety("mg")
++    self.safety = libsafety_py.libsafety
++    self.safety.set_safety_hooks(CarParams.SafetyModel.mg, 0)
++    self.safety.init_tests()
++
++  def _torque_cmd_msg(self, torque, steer_req=1):
++    values = {"LKAReqToqHSC2": torque, "LKAReqToqStsHSC2": steer_req}
++    return self.packer.make_can_msg_safety("FVCM_HSC2_FrP03", 0, values)
++
++  def _speed_msg(self, speed):
++    values = {"VehSpdAvgHSC2": speed * 3.6}
++    return self.packer.make_can_msg_safety("SCS_HSC2_FrP19", 0, values)
++
++  def _torque_driver_msg(self, torque):
++    values = {"DrvrStrgDlvrdToqHSC2": torque * 0.01}
++    return self.packer.make_can_msg_safety("EPS_HSC2_FrP03", 0, values)
++
++  def _user_brake_msg(self, brake):
++    values = {"BrkPdlAppdHSC2": 1 if brake else 0}
++    return self.packer.make_can_msg_safety("EHBS_HSC2_FrP00", 0, values)
++
++  def _user_gas_msg(self, gas):
++    values = {"EPTAccelActuPosHSC2": 100 if gas else 0}
++    return self.packer.make_can_msg_safety("GW_HSC2_HCU_FrP00", 0, values)
++
++  def _pcm_status_msg(self, enable):
++    values = {"ACCSysSts_RadarHSC2": 2 if enable else 1}
++    return self.packer.make_can_msg_safety("RADAR_HSC2_FrP00", 0, values)
++
++
++class TestMGAltBrakeSafety(TestMGSafety):
++  def setUp(self):
++    self.packer = CANPackerSafety("mg")
++    self.safety = libsafety_py.libsafety
++    self.safety.set_safety_hooks(CarParams.SafetyModel.mg, 2)
++    self.safety.init_tests()
++
++  def _user_brake_msg(self, brake):
++    values = {"EPTBrkPdlDscrtInptStsHSC2": 1 if brake else 0}
++    return self.packer.make_can_msg_safety("GW_HSC2_HCU_FrP00", 0, values)
++
++
++if __name__ == "__main__":
++  unittest.main()
+diff --git a/opendbc/safety/tests/test_tesla_hw1.py b/opendbc/safety/tests/test_tesla_hw1.py
+new file mode 100755
+index 00000000..f1d0f55a
+--- /dev/null
++++ b/opendbc/safety/tests/test_tesla_hw1.py
+@@ -0,0 +1,312 @@
++#!/usr/bin/env python3
++import random
++import unittest
++import numpy as np
++
++from opendbc.car.lateral import get_max_angle_delta_vm, get_max_angle_vm
++from opendbc.car.tesla.values import CarControllerParams, TeslaSafetyFlags
++from opendbc.car.structs import CarParams
++from opendbc.car.vehicle_model import VehicleModel
++from opendbc.can import CANDefine
++from opendbc.safety.tests.libsafety import libsafety_py
++import opendbc.safety.tests.common as common
++from opendbc.safety.tests.common import CANPackerSafety, MAX_SPEED_DELTA, MAX_WRONG_COUNTERS, away_round, round_speed
++
++MSG_DAS_steeringControl = 0x488
++MSG_DAS_Control_HW1 = 0x2b9
++MSG_DI_torque1 = 0x108  # HW1 uses different message ID
++
++
++def round_angle(apply_angle, can_offset=0):
++  apply_angle_can = (apply_angle + 1638.35) / 0.1 + can_offset
++  # 0.49999_ == 0.5
++  rnd_offset = 1e-5 if apply_angle >= 0 else -1e-5
++  return away_round(apply_angle_can + rnd_offset) * 0.1 - 1638.35
++
++
++class TestTeslaHW1Safety(common.PandaCarSafetyTest, common.AngleSteeringSafetyTest, common.LongitudinalAccelSafetyTest):
++  # HW1 configuration - based on tesla_legacy.h
++  RELAY_MALFUNCTION_ADDRS = {0: (MSG_DAS_steeringControl, MSG_DAS_Control_HW1)}
++  FWD_BLACKLISTED_ADDRS = {2: [MSG_DAS_steeringControl, MSG_DAS_Control_HW1]}
++  TX_MSGS = [[MSG_DAS_steeringControl, 0], [MSG_DAS_Control_HW1, 0]]
++
++  STANDSTILL_THRESHOLD = 0.1
++  GAS_PRESSED_THRESHOLD = 3
++  LONGITUDINAL = True
++
++  # Angle control limits
++  STEER_ANGLE_MAX = 360  # deg
++  DEG_TO_CAN = 10
++
++  # Tesla uses get_max_angle_delta_vm and get_max_angle_vm for real lateral accel and jerk limits
++  ANGLE_RATE_BP = None
++  ANGLE_RATE_UP = None
++  ANGLE_RATE_DOWN = None
++
++  # Real time limits
++  LATERAL_FREQUENCY = 50  # Hz
++
++  # Long control limits
++  MAX_ACCEL = 2.0
++  MIN_ACCEL = -3.48
++  INACTIVE_ACCEL = 0.0
++
++  cnt_epas = 0
++  cnt_angle_cmd = 0
++
++  def _get_steer_cmd_angle_max(self, speed):
++    return get_max_angle_vm(max(speed, 1), self.VM, CarControllerParams)
++
++  def setUp(self):
++    from opendbc.car.tesla.interface import CarInterface
++    self.VM = VehicleModel(CarInterface.get_non_essential_params("TESLA_MODEL_S_HW3"))
++
++    # HW1 uses tesla_can DBC for most messages
++    self.packer = CANPackerSafety("tesla_can")
++
++    self.define = CANDefine("tesla_can")
++    self.acc_states = {d: v for v, d in self.define.dv["DAS_control"]["DAS_accState"].items()}
++    self.steer_control_types = {d: v for v, d in
++                                self.define.dv["DAS_steeringControl"]["DAS_steeringControlType"].items()}
++
++    self.safety = libsafety_py.libsafety
++    self.safety.set_safety_hooks(CarParams.SafetyModel.teslaLegacy, int(TeslaSafetyFlags.FLAG_HW1))
++    self.safety.init_tests()
++
++  def _angle_cmd_msg(self, angle: float, state: bool | int, increment_timer: bool = True, bus: int = 0):
++    values = {"DAS_steeringAngleRequest": angle, "DAS_steeringControlType": state}
++    if increment_timer:
++      self.safety.set_timer(self.cnt_angle_cmd * int(1e6 / self.LATERAL_FREQUENCY))
++      self.__class__.cnt_angle_cmd += 1
++    return self.packer.make_can_msg_safety("DAS_steeringControl", bus, values)
++
++  def _angle_meas_msg(self, angle: float, hands_on_level: int = 0, eac_status: int = 1, eac_error_code: int = 0):
++    # HW1 uses EPAS_sysStatus message with EPAS_* signals (not EPAS3S_*)
++    values = {
++      "EPAS_internalSAS": angle,
++      "EPAS_handsOnLevel": hands_on_level,
++      "EPAS_eacStatus": eac_status,
++      "EPAS_eacErrorCode": eac_error_code
++    }
++    return self.packer.make_can_msg_safety("EPAS_sysStatus", 0, values)
++
++  def _user_brake_msg(self, brake):
++    # HW1 uses BrakeMessage with driverBrakeStatus signal
++    values = {"driverBrakeStatus": 2 if brake else 1}
++    return self.packer.make_can_msg_safety("BrakeMessage", 0, values)
++
++  def _speed_msg(self, speed):
++    # HW1 uses ESP_B message with ESP_vehicleSpeed signal
++    values = {"ESP_vehicleSpeed": speed * 3.6}  # Convert m/s to km/h
++    return self.packer.make_can_msg_safety("ESP_B", 0, values)
++
++  def _vehicle_moving_msg(self, speed: float):
++    values = {"DI_cruiseState": 3 if speed <= self.STANDSTILL_THRESHOLD else 2}
++    return self.packer.make_can_msg_safety("DI_state", 0, values)
++
++  def _user_gas_msg(self, gas):
++    # HW1 uses DI_torque1 message (0x108) with DI_pedalPos signal
++    values = {"DI_pedalPos": gas}
++    return self.packer.make_can_msg_safety("DI_torque1", 0, values)
++
++  def _pcm_status_msg(self, enable):
++    values = {"DI_cruiseState": 2 if enable else 0}
++    return self.packer.make_can_msg_safety("DI_state", 0, values)
++
++  def _long_control_msg(self, set_speed, acc_state=0, jerk_limits=(0, 0), accel_limits=(0, 0), aeb_event=0, bus=0):
++    # HW1 uses DAS_control message (0x2b9)
++    values = {
++      "DAS_setSpeed": set_speed,
++      "DAS_accState": acc_state,
++      "DAS_aebEvent": aeb_event,
++      "DAS_jerkMin": jerk_limits[0],
++      "DAS_jerkMax": jerk_limits[1],
++      "DAS_accelMin": accel_limits[0],
++      "DAS_accelMax": accel_limits[1],
++    }
++    return self.packer.make_can_msg_safety("DAS_control", bus, values)
++
++  def _accel_msg(self, accel: float):
++    return self._long_control_msg(10, accel_limits=(accel, max(accel, 0)))
++
++  def test_rx_hook(self):
++    # Legacy models don't have checksums for most messages
++    # Test basic message reception
++    for msg_type in ("angle", "long", "speed"):
++      for i in range(5):
++        if msg_type == "angle":
++          msg = self._angle_cmd_msg(0, True, bus=2)
++        elif msg_type == "long":
++          msg = self._long_control_msg(0, bus=2)
++        elif msg_type == "speed":
++          msg = self._speed_msg(0)
++        else:
++          continue
++
++        self.safety.set_controls_allowed(True)
++        self.assertTrue(self._rx(msg))
++        self.assertTrue(self.safety.get_controls_allowed())
++
++  def test_vehicle_speed_measurements(self):
++    # HW1 uses ESP_B message for speed
++    self._common_measurement_test(self._speed_msg, 0, 285 / 3.6, 1,
++                                  self.safety.get_vehicle_speed_min, self.safety.get_vehicle_speed_max)
++
++  def test_steering_wheel_disengage(self):
++    # Tesla disengages when the user forcibly overrides the locked-in angle steering control
++    # Either when the hands on level is high, or if there is a high angle rate fault
++    for hands_on_level in range(4):
++      for eac_status in range(8):
++        for eac_error_code in range(16):
++          self.safety.set_controls_allowed(True)
++
++          should_disengage = hands_on_level >= 3 or (eac_status == 0 and eac_error_code == 9)
++          self.assertTrue(self._rx(self._angle_meas_msg(0, hands_on_level=hands_on_level, eac_status=eac_status,
++                                                        eac_error_code=eac_error_code)))
++          self.assertNotEqual(should_disengage, self.safety.get_controls_allowed())
++          self.assertEqual(should_disengage, self.safety.get_steering_disengage_prev())
++
++          # Should not recover
++          self.assertTrue(self._rx(self._angle_meas_msg(0, hands_on_level=0, eac_status=1, eac_error_code=0)))
++          self.assertNotEqual(should_disengage, self.safety.get_controls_allowed())
++          self.assertFalse(self.safety.get_steering_disengage_prev())
++
++  def test_steering_control_type(self):
++    # Test valid steering control types
++    self.safety.set_controls_allowed(True)
++    for steer_control_type in range(4):
++      should_tx = steer_control_type in (self.steer_control_types["NONE"],
++                                         self.steer_control_types["ANGLE_CONTROL"])
++      self.assertEqual(should_tx, self._tx(self._angle_cmd_msg(0, state=steer_control_type)))
++
++  def test_stock_lkas_passthrough(self):
++    # TODO: make these generic passthrough tests
++    no_lkas_msg = self._angle_cmd_msg(0, state=False)
++    no_lkas_msg_cam = self._angle_cmd_msg(0, state=True, bus=2)
++    lkas_msg_cam = self._angle_cmd_msg(0, state=self.steer_control_types['LANE_KEEP_ASSIST'], bus=2)
++
++    # stock system sends no LKAS -> no forwarding, and OP is allowed to TX
++    self.assertEqual(1, self._rx(no_lkas_msg_cam))
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, no_lkas_msg_cam.addr))
++    self.assertTrue(self._tx(no_lkas_msg))
++
++    # stock system sends LKAS -> forwarding, and OP is not allowed to TX
++    self.assertEqual(1, self._rx(lkas_msg_cam))
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, lkas_msg_cam.addr))
++    self.assertFalse(self._tx(no_lkas_msg))
++
++  def test_no_aeb(self):
++    # Test that AEB events are blocked
++    for aeb_event in range(4):
++      self.assertEqual(self._tx(self._long_control_msg(10, aeb_event=aeb_event)), aeb_event == 0)
++
++  def test_stock_aeb_passthrough(self):
++    # HW1 AEB passthrough logic
++    no_aeb_msg = self._long_control_msg(10, aeb_event=0)
++    no_aeb_msg_cam = self._long_control_msg(10, aeb_event=0, bus=2)
++    aeb_msg_cam = self._long_control_msg(10, aeb_event=1, bus=2)
++
++    # stock system sends no AEB -> block forwarding, and OP is allowed to TX
++    self.assertEqual(1, self._rx(no_aeb_msg_cam))
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, no_aeb_msg_cam.addr))
++    self.assertTrue(self._tx(no_aeb_msg))
++
++    # stock system sends AEB -> allow forwarding, and OP is not allowed to TX
++    self.assertEqual(1, self._rx(aeb_msg_cam))
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, aeb_msg_cam.addr))
++    self.assertFalse(self._tx(no_aeb_msg))
++
++  def test_prevent_reverse(self):
++    # Test reverse prevention logic - use the same test as modern Tesla
++    self.safety.set_controls_allowed(True)
++
++    # accel_min and accel_max are positive
++    self.assertTrue(self._tx(self._long_control_msg(set_speed=10, accel_limits=(1.1, 0.8))))
++    self.assertTrue(self._tx(self._long_control_msg(set_speed=0, accel_limits=(1.1, 0.8))))
++
++    # accel_min and accel_max are both zero
++    self.assertTrue(self._tx(self._long_control_msg(set_speed=10, accel_limits=(0, 0))))
++    self.assertTrue(self._tx(self._long_control_msg(set_speed=0, accel_limits=(0, 0))))
++
++    # accel_min and accel_max have opposing signs
++    self.assertTrue(self._tx(self._long_control_msg(set_speed=10, accel_limits=(-0.8, 1.3))))
++    self.assertTrue(self._tx(self._long_control_msg(set_speed=0, accel_limits=(0.8, -1.3))))
++    self.assertTrue(self._tx(self._long_control_msg(set_speed=0, accel_limits=(0, -1.3))))
++
++    # accel_min and accel_max are negative
++    self.assertFalse(self._tx(self._long_control_msg(set_speed=10, accel_limits=(-1.1, -0.6))))
++    self.assertFalse(self._tx(self._long_control_msg(set_speed=0, accel_limits=(-0.6, -1.1))))
++    self.assertFalse(self._tx(self._long_control_msg(set_speed=0, accel_limits=(-0.1, -0.1))))
++
++  def test_angle_cmd_when_enabled(self):
++    # We properly test lateral acceleration and jerk below
++    pass
++
++  def test_lateral_accel_limit(self):
++    for speed in np.linspace(0, 40, 100):
++      speed = max(speed, 1)
++      speed = round_speed(away_round(speed / 0.01 * 3.6) * 0.01 / 3.6)
++      for sign in (-1, 1):
++        self.safety.set_controls_allowed(True)
++        self._reset_speed_measurement(speed + 1)  # safety fudges the speed
++
++        # angle signal can't represent 0, so it biases one unit down
++        angle_unit_offset = -1 if sign == -1 else 0
++
++        # at limit (safety tolerance adds 1)
++        max_angle = round_angle(get_max_angle_vm(speed, self.VM, CarControllerParams), angle_unit_offset + 1) * sign
++        max_angle = np.clip(max_angle, -self.STEER_ANGLE_MAX, self.STEER_ANGLE_MAX)
++        self.safety.set_desired_angle_last(round(max_angle * self.DEG_TO_CAN))
++
++        self.assertTrue(self._tx(self._angle_cmd_msg(max_angle, True)))
++
++        # 1 unit above limit
++        max_angle_raw = round_angle(get_max_angle_vm(speed, self.VM, CarControllerParams), angle_unit_offset + 2) * sign
++        max_angle = np.clip(max_angle_raw, -self.STEER_ANGLE_MAX, self.STEER_ANGLE_MAX)
++        self._tx(self._angle_cmd_msg(max_angle, True))
++
++        # at low speeds max angle is above 360, so adding 1 has no effect
++        should_tx = abs(max_angle_raw) >= self.STEER_ANGLE_MAX
++        self.assertEqual(should_tx, self._tx(self._angle_cmd_msg(max_angle, True)))
++
++  def test_lateral_jerk_limit(self):
++    for speed in np.linspace(0, 40, 100):
++      speed = max(speed, 1)
++      speed = round_speed(away_round(speed / 0.01 * 3.6) * 0.01 / 3.6)
++      for sign in (-1, 1):  # (-1, 1):
++        self.safety.set_controls_allowed(True)
++        self._reset_speed_measurement(speed + 1)  # safety fudges the speed
++        self._tx(self._angle_cmd_msg(0, True))
++
++        # angle signal can't represent 0, so it biases one unit down
++        angle_unit_offset = 1 if sign == -1 else 0
++
++        # Stay within limits
++        # Up
++        max_angle_delta = round_angle(get_max_angle_delta_vm(speed, self.VM, CarControllerParams), angle_unit_offset) * sign
++        self.assertTrue(self._tx(self._angle_cmd_msg(max_angle_delta, True)))
++
++        # Don't change
++        self.assertTrue(self._tx(self._angle_cmd_msg(max_angle_delta, True)))
++
++        # Down
++        self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
++
++        # Inject too high rates
++        # Up
++        max_angle_delta = round_angle(get_max_angle_delta_vm(speed, self.VM, CarControllerParams), angle_unit_offset + 1) * sign
++        self.assertFalse(self._tx(self._angle_cmd_msg(max_angle_delta, True)))
++
++        # Don't change
++        self.safety.set_desired_angle_last(round(max_angle_delta * self.DEG_TO_CAN))
++        self.assertTrue(self._tx(self._angle_cmd_msg(max_angle_delta, True)))
++
++        # Down
++        self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
++
++        # Recover
++        self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
++
++
++if __name__ == "__main__":
++  unittest.main()
+diff --git a/opendbc/safety/tests/test_tesla_hw23.py b/opendbc/safety/tests/test_tesla_hw23.py
+new file mode 100755
+index 00000000..e7dc102a
+--- /dev/null
++++ b/opendbc/safety/tests/test_tesla_hw23.py
+@@ -0,0 +1,391 @@
++#!/usr/bin/env python3
++import unittest
++import numpy as np
++
++from opendbc.car.lateral import get_max_angle_delta_vm, get_max_angle_vm
++from opendbc.car.tesla.values import CarControllerParams, TeslaSafetyFlags
++from opendbc.car.structs import CarParams
++from opendbc.car.vehicle_model import VehicleModel
++from opendbc.can import CANDefine
++from opendbc.safety.tests.libsafety import libsafety_py
++import opendbc.safety.tests.common as common
++from opendbc.safety.tests.common import CANPackerSafety, away_round, round_speed
++
++MSG_DAS_steeringControl = 0x488
++MSG_APS_eacMonitor = 0x27d
++MSG_DAS_Control_HW23 = 0x2bf
++
++
++def round_angle(apply_angle, can_offset=0):
++  apply_angle_can = (apply_angle + 1638.35) / 0.1 + can_offset
++  # 0.49999_ == 0.5
++  rnd_offset = 1e-5 if apply_angle >= 0 else -1e-5
++  return away_round(apply_angle_can + rnd_offset) * 0.1 - 1638.35
++
++
++class TeslaLegacyLateralBase(common.PandaCarSafetyTest, common.AngleSteeringSafetyTest):
++  """Base class for Tesla Legacy lateral (steering) control tests"""
++
++  STANDSTILL_THRESHOLD = 0.1
++  GAS_PRESSED_THRESHOLD = 3
++
++  # Angle control limits
++  STEER_ANGLE_MAX = 360  # deg
++  DEG_TO_CAN = 10
++
++  # Tesla uses get_max_angle_delta_vm and get_max_angle_vm for real lateral accel and jerk limits
++  ANGLE_RATE_BP = None
++  ANGLE_RATE_UP = None
++  ANGLE_RATE_DOWN = None
++
++  # Real time limits
++  LATERAL_FREQUENCY = 50  # Hz
++
++  cnt_epas = 0
++  cnt_angle_cmd = 0
++  packer: CANPackerSafety
++  packer_chassis: CANPackerSafety
++  packer_powertrain: CANPackerSafety
++
++  def _get_steer_cmd_angle_max(self, speed):
++    return get_max_angle_vm(max(speed, 1), self.VM, CarControllerParams)
++
++  def setUp(self):
++    from opendbc.car.tesla.interface import CarInterface
++    self.VM = VehicleModel(CarInterface.get_non_essential_params("TESLA_MODEL_S_HW3"))
++
++    # Tesla Legacy uses tesla_can DBC
++    self.packer = CANPackerSafety("tesla_can")
++    self.packer_chassis = CANPackerSafety("tesla_can")
++    self.packer_powertrain = CANPackerSafety("tesla_powertrain")
++
++    self.steer_control_types = {'NONE': 0, 'ANGLE_CONTROL': 1, 'LANE_KEEP_ASSIST': 2, 'EMERGENCY_LANE_KEEP': 3}
++
++  def _angle_cmd_msg(self, angle: float, state: bool | int, increment_timer: bool = True, bus: int = 0):
++    values = {"DAS_steeringAngleRequest": angle, "DAS_steeringControlType": state}
++    if increment_timer:
++      self.safety.set_timer(self.cnt_angle_cmd * int(1e6 / self.LATERAL_FREQUENCY))
++      self.__class__.cnt_angle_cmd += 1
++    return self.packer.make_can_msg_safety("DAS_steeringControl", bus, values)
++
++  def _angle_meas_msg(self, angle: float, hands_on_level: int = 0, eac_status: int = 1, eac_error_code: int = 0):
++    # Legacy uses EPAS_sysStatus message with EPAS_* signals (not EPAS3S_*)
++    values = {
++      "EPAS_internalSAS": angle,
++      "EPAS_handsOnLevel": hands_on_level,
++      "EPAS_eacStatus": eac_status,
++      "EPAS_eacErrorCode": eac_error_code
++    }
++    return self.packer.make_can_msg_safety("EPAS_sysStatus", 0, values)
++
++  def _user_brake_msg(self, brake):
++    values = {"driverBrakeStatus": 2 if brake else 1}
++    return self.packer_chassis.make_can_msg_safety("BrakeMessage", self.chassis_bus, values)
++
++  def _speed_msg(self, speed):
++    values = {"ESP_vehicleSpeed": speed * 3.6}  # Convert m/s to km/h
++    return self.packer_chassis.make_can_msg_safety("ESP_B", self.chassis_bus, values)
++
++  def _vehicle_moving_msg(self, speed: float):
++    values = {"DI_cruiseState": 3 if speed <= self.STANDSTILL_THRESHOLD else 2, "DI_speedUnits": 1}  # 1 = KPH
++    return self.packer_chassis.make_can_msg_safety("DI_state", self.chassis_bus, values)
++
++  def _user_gas_msg(self, gas):
++    values = {"DI_pedalPos": gas}
++    return self.packer_chassis.make_can_msg_safety("DI_torque1", self.chassis_bus, values)
++
++  def _pcm_status_msg(self, enable):
++    values = {"DI_cruiseState": 2 if enable else 0, "DI_speedUnits": 1}  # 1 = KPH
++    return self.packer_chassis.make_can_msg_safety("DI_state", self.chassis_bus, values)
++
++  def test_rx_hook(self):
++    # Test angle command reception
++    for i in range(5):
++      msg = self._angle_cmd_msg(0, True, bus=2)
++      self.safety.set_controls_allowed(True)
++      self.assertTrue(self._rx(msg))
++      self.assertTrue(self.safety.get_controls_allowed())
++
++    # Test speed message reception
++    for i in range(5):
++      msg = self._speed_msg(0)
++      self.safety.set_controls_allowed(True)
++      self.assertTrue(self._rx(msg))
++      self.assertTrue(self.safety.get_controls_allowed())
++
++  def test_vehicle_speed_measurements(self):
++    self._common_measurement_test(self._speed_msg, 0, 285 / 3.6, 1,
++                                  self.safety.get_vehicle_speed_min, self.safety.get_vehicle_speed_max)
++
++  def test_steering_wheel_disengage(self):
++    for hands_on_level in range(4):
++      for eac_status in range(8):
++        for eac_error_code in range(16):
++          self.safety.set_controls_allowed(True)
++
++          should_disengage = hands_on_level >= 3 or (eac_status == 0 and eac_error_code == 9)
++          self.assertTrue(self._rx(self._angle_meas_msg(0, hands_on_level=hands_on_level,
++                                                        eac_status=eac_status, eac_error_code=eac_error_code)))
++          self.assertNotEqual(should_disengage, self.safety.get_controls_allowed())
++          self.assertEqual(should_disengage, self.safety.get_steering_disengage_prev())
++
++          # Should not recover
++          self.assertTrue(self._rx(self._angle_meas_msg(0, hands_on_level=0, eac_status=1, eac_error_code=0)))
++          self.assertNotEqual(should_disengage, self.safety.get_controls_allowed())
++          self.assertFalse(self.safety.get_steering_disengage_prev())
++
++  def test_steering_control_type(self):
++    self.safety.set_controls_allowed(True)
++    for steer_control_type in range(4):
++      should_tx = steer_control_type in (self.steer_control_types["NONE"],
++                                         self.steer_control_types["ANGLE_CONTROL"])
++      self.assertEqual(should_tx, self._tx(self._angle_cmd_msg(0, state=steer_control_type)))
++
++  def test_stock_lkas_passthrough(self):
++    no_lkas_msg = self._angle_cmd_msg(0, state=False)
++    no_lkas_msg_cam = self._angle_cmd_msg(0, state=True, bus=2)
++    lkas_msg_cam = self._angle_cmd_msg(0, state=self.steer_control_types['LANE_KEEP_ASSIST'], bus=2)
++
++    # stock system sends no LKAS -> block forwarding, and OP is allowed to TX
++    self.assertEqual(1, self._rx(no_lkas_msg_cam))
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, no_lkas_msg_cam.addr))
++    self.assertTrue(self._tx(no_lkas_msg))
++
++    # stock system sends LKAS -> allow forwarding, and OP is not allowed to TX
++    self.assertEqual(1, self._rx(lkas_msg_cam))
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, lkas_msg_cam.addr))
++    self.assertFalse(self._tx(no_lkas_msg))
++
++  def test_angle_cmd_when_enabled(self):
++    # We properly test lateral acceleration and jerk below
++    pass
++
++  #########################################################################
++  # These tests are only relevant for longitudinal control (external panda).
++  #########################################################################
++
++  def test_prev_gas(self):
++    pass
++
++  def test_no_disengage_on_gas(self):
++    pass
++
++  #########################################################################
++  #########################################################################
++
++  def test_lateral_accel_limit(self):
++    for speed in np.linspace(0, 40, 50):  # Reduced iterations for legacy tests
++      speed = max(speed, 1)
++      speed = round_speed(away_round(speed / 0.01 * 3.6) * 0.01 / 3.6)
++      for sign in (-1, 1):
++        self.safety.set_controls_allowed(True)
++        self._reset_speed_measurement(speed + 1)
++
++        angle_unit_offset = -1 if sign == -1 else 0
++        max_angle = round_angle(get_max_angle_vm(speed, self.VM, CarControllerParams), angle_unit_offset + 1) * sign
++        max_angle = np.clip(max_angle, -self.STEER_ANGLE_MAX, self.STEER_ANGLE_MAX)
++        self.safety.set_desired_angle_last(round(max_angle * self.DEG_TO_CAN))
++
++        self.assertTrue(self._tx(self._angle_cmd_msg(max_angle, True)))
++
++        # 1 unit above limit
++        max_angle_raw = round_angle(get_max_angle_vm(speed, self.VM, CarControllerParams), angle_unit_offset + 2) * sign
++        max_angle = np.clip(max_angle_raw, -self.STEER_ANGLE_MAX, self.STEER_ANGLE_MAX)
++        self._tx(self._angle_cmd_msg(max_angle, True))
++
++        # at low speeds max angle is above 360, so adding 1 has no effect
++        should_tx = abs(max_angle_raw) >= self.STEER_ANGLE_MAX
++        self.assertEqual(should_tx, self._tx(self._angle_cmd_msg(max_angle, True)))
++
++  def test_lateral_jerk_limit(self):
++    for speed in np.linspace(0, 40, 50):  # Reduced iterations for legacy tests
++      speed = max(speed, 1)
++      speed = round_speed(away_round(speed / 0.01 * 3.6) * 0.01 / 3.6)
++      for sign in (-1, 1):
++        self.safety.set_controls_allowed(True)
++        self._reset_speed_measurement(speed + 1)
++        self._tx(self._angle_cmd_msg(0, True))
++
++        angle_unit_offset = 1 if sign == -1 else 0
++
++        # Stay within limits - Up
++        max_angle_delta = round_angle(get_max_angle_delta_vm(speed, self.VM, CarControllerParams),
++                                      angle_unit_offset) * sign
++        self.assertTrue(self._tx(self._angle_cmd_msg(max_angle_delta, True)))
++
++        # Don't change
++        self.assertTrue(self._tx(self._angle_cmd_msg(max_angle_delta, True)))
++
++        # Down
++        self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
++
++        # Inject too high rates - Up
++        max_angle_delta = round_angle(get_max_angle_delta_vm(speed, self.VM, CarControllerParams),
++                                      angle_unit_offset + 1) * sign
++        self.assertFalse(self._tx(self._angle_cmd_msg(max_angle_delta, True)))
++
++        # Don't change
++        self.safety.set_desired_angle_last(round(max_angle_delta * self.DEG_TO_CAN))
++        self.assertTrue(self._tx(self._angle_cmd_msg(max_angle_delta, True)))
++
++        # Down
++        self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
++
++        # Recover
++        self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
++
++
++class TeslaLegacyLongitudinalBase(common.PandaCarSafetyTest, common.LongitudinalAccelSafetyTest):
++  """Base class for Tesla Legacy longitudinal (acceleration) control tests"""
++
++  STANDSTILL_THRESHOLD = 0.1
++  GAS_PRESSED_THRESHOLD = 3
++
++  # Long control limits
++  MAX_ACCEL = 2.0
++  MIN_ACCEL = -3.48
++  INACTIVE_ACCEL = 0.0
++
++  def setUp(self):
++    # Tesla Legacy uses tesla_can DBC
++    self.packer = CANPackerSafety("tesla_powertrain")
++
++  def _vehicle_moving_msg(self, speed: float):
++    values = {"DI_cruiseState": 3 if speed <= self.STANDSTILL_THRESHOLD else 2, "DI_speedUnits": 1}  # 1 = KPH
++    return self.packer.make_can_msg_safety("DI_state", 0, values)
++
++  def _user_brake_msg(self, brake):
++    values = {"driverBrakeStatus": 2 if brake else 1}
++    return self.packer.make_can_msg_safety("BrakeMessage", 0, values)
++
++  def _user_gas_msg(self, gas):
++    values = {"DI_pedalPos": gas}
++    return self.packer.make_can_msg_safety("DI_torque1", 0, values)
++
++  def _pcm_status_msg(self, enable):
++    values = {"DI_cruiseState": 2 if enable else 0, "DI_speedUnits": 1}  # 1 = KPH
++    return self.packer.make_can_msg_safety("DI_state", 0, values)
++
++  def _long_control_msg(self, set_speed, acc_state=0, jerk_limits=(0, 0), accel_limits=(0, 0), aeb_event=0, bus=0):
++    values = {
++      "DAS_setSpeed": set_speed,
++      "DAS_accState": acc_state,
++      "DAS_aebEvent": aeb_event,
++      "DAS_jerkMin": jerk_limits[0],
++      "DAS_jerkMax": jerk_limits[1],
++      "DAS_accelMin": accel_limits[0],
++      "DAS_accelMax": accel_limits[1],
++    }
++    return self.packer.make_can_msg_safety("DAS_control", bus, values)
++
++  def _accel_msg(self, accel: float):
++    return self._long_control_msg(10, accel_limits=(accel, max(accel, 0)))
++
++  def test_rx_hook(self):
++    # Test longitudinal command reception
++    for i in range(5):
++      msg = self._long_control_msg(0, bus=2)
++      self.safety.set_controls_allowed(True)
++      self.assertTrue(self._rx(msg))
++      self.assertTrue(self.safety.get_controls_allowed())
++
++  def test_no_aeb(self):
++    for aeb_event in range(4):
++      self.assertEqual(self._tx(self._long_control_msg(10, aeb_event=aeb_event)), aeb_event == 0)
++
++  def test_stock_aeb_passthrough(self):
++    no_aeb_msg = self._long_control_msg(10, aeb_event=0)
++    no_aeb_msg_cam = self._long_control_msg(10, aeb_event=0, bus=2)
++    aeb_msg_cam = self._long_control_msg(10, aeb_event=1, bus=2)
++
++    # stock system sends no AEB -> block forwarding, and OP is allowed to TX
++    self.assertEqual(1, self._rx(no_aeb_msg_cam))
++    self.assertEqual(-1, self.safety.safety_fwd_hook(2, no_aeb_msg_cam.addr))
++    self.assertTrue(self._tx(no_aeb_msg))
++
++    # stock system sends AEB -> allow forwarding, and OP is not allowed to TX
++    self.assertEqual(1, self._rx(aeb_msg_cam))
++    self.assertEqual(0, self.safety.safety_fwd_hook(2, aeb_msg_cam.addr))
++    self.assertFalse(self._tx(no_aeb_msg))
++
++  def test_prevent_reverse(self):
++    self.safety.set_controls_allowed(True)
++
++    # accel_min and accel_max are positive
++    self.assertTrue(self._tx(self._long_control_msg(set_speed=10, accel_limits=(1.1, 0.8))))
++    self.assertTrue(self._tx(self._long_control_msg(set_speed=0, accel_limits=(1.1, 0.8))))
++
++    # accel_min and accel_max are both zero
++    self.assertTrue(self._tx(self._long_control_msg(set_speed=10, accel_limits=(0, 0))))
++    self.assertTrue(self._tx(self._long_control_msg(set_speed=0, accel_limits=(0, 0))))
++
++    # accel_min and accel_max have opposing signs
++    self.assertTrue(self._tx(self._long_control_msg(set_speed=10, accel_limits=(-0.8, 1.3))))
++    self.assertTrue(self._tx(self._long_control_msg(set_speed=0, accel_limits=(0.8, -1.3))))
++    self.assertTrue(self._tx(self._long_control_msg(set_speed=0, accel_limits=(0, -1.3))))
++
++    # accel_min and accel_max are negative
++    self.assertFalse(self._tx(self._long_control_msg(set_speed=10, accel_limits=(-1.1, -0.6))))
++    self.assertFalse(self._tx(self._long_control_msg(set_speed=0, accel_limits=(-0.6, -1.1))))
++    self.assertFalse(self._tx(self._long_control_msg(set_speed=0, accel_limits=(-0.1, -0.1))))
++
++
++# Lateral control tests (HW2 and HW3 non-external panda)
++class TestTeslaHW2Safety(TeslaLegacyLateralBase):
++  chassis_bus = 0
++
++  def setUp(self):
++    super().setUp()
++    self.RELAY_MALFUNCTION_ADDRS = {0: (MSG_DAS_steeringControl, MSG_APS_eacMonitor)}
++    self.FWD_BLACKLISTED_ADDRS = {2: [MSG_DAS_steeringControl, MSG_APS_eacMonitor]}
++    self.TX_MSGS = [[MSG_DAS_steeringControl, 0], [MSG_APS_eacMonitor, 0]]
++
++    self.safety = libsafety_py.libsafety
++    self.safety.set_safety_hooks(CarParams.SafetyModel.teslaLegacy, int(TeslaSafetyFlags.FLAG_HW2))
++    self.safety.init_tests()
++
++
++class TestTeslaHW3Safety(TeslaLegacyLateralBase):
++  chassis_bus = 1  # HW3 uses bus 1 for chassis
++
++  def setUp(self):
++    super().setUp()
++    self.RELAY_MALFUNCTION_ADDRS = {0: (MSG_DAS_steeringControl, MSG_APS_eacMonitor)}
++    self.FWD_BLACKLISTED_ADDRS = {2: [MSG_DAS_steeringControl, MSG_APS_eacMonitor]}
++    self.TX_MSGS = [[MSG_DAS_steeringControl, 0], [MSG_APS_eacMonitor, 0]]
++
++    self.safety = libsafety_py.libsafety
++    self.safety.set_safety_hooks(CarParams.SafetyModel.teslaLegacy, int(TeslaSafetyFlags.FLAG_HW3))
++    self.safety.init_tests()
++
++    self.packer = CANPackerSafety("tesla_raven_party")
++
++# Longitudinal control tests (external panda configurations)
++class TestTeslaHW2ExternalPandaSafety(TeslaLegacyLongitudinalBase):
++  def setUp(self):
++    super().setUp()
++    self.RELAY_MALFUNCTION_ADDRS = {0: (MSG_DAS_Control_HW23,)}
++    self.FWD_BLACKLISTED_ADDRS = {2: [MSG_DAS_Control_HW23]}
++    self.TX_MSGS = [[MSG_DAS_Control_HW23, 0]]
++
++    self.safety = libsafety_py.libsafety
++    self.safety.set_safety_hooks(CarParams.SafetyModel.teslaLegacy,
++                                 int(TeslaSafetyFlags.FLAG_HW2 | TeslaSafetyFlags.FLAG_EXTERNAL_PANDA))
++    self.safety.init_tests()
++
++
++class TestTeslaHW3ExternalPandaSafety(TeslaLegacyLongitudinalBase):
++  def setUp(self):
++    super().setUp()
++    self.RELAY_MALFUNCTION_ADDRS = {0: (MSG_DAS_Control_HW23,)}
++    self.FWD_BLACKLISTED_ADDRS = {2: [MSG_DAS_Control_HW23]}
++    self.TX_MSGS = [[MSG_DAS_Control_HW23, 0]]
++
++    self.safety = libsafety_py.libsafety
++    self.safety.set_safety_hooks(CarParams.SafetyModel.teslaLegacy,
++                                 int(TeslaSafetyFlags.FLAG_HW3 | TeslaSafetyFlags.FLAG_EXTERNAL_PANDA))
++    self.safety.init_tests()
++
++
++if __name__ == "__main__":
++  unittest.main()
+-- 
+2.43.0
+
