@@ -93,13 +93,33 @@ def main() -> None:
 
       panda_serials = Panda.list()
       if len(panda_serials):
-        assert len(panda_serials) == 1
-        cloudlog.info(f"{len(panda_serials)} panda found, connecting - {panda_serials}")
-        flash_panda(panda_serials[0])
+        cloudlog.info(f"{len(panda_serials)} panda(s) found, connecting - {panda_serials}")
 
-        # run real pandad
+        # multipanda: flash the internal panda and any external pandas
+        for serial in panda_serials:
+          flash_panda(serial)
+
+        # gather hardware info to order the pandas
+        panda_info = {}
+        for serial in panda_serials:
+          with Panda(serial) as p:
+            panda_info[serial] = (p.is_internal(), p.get_type())
+
+        # Ensure internal panda is present if expected
+        if HARDWARE.has_internal_panda() and not any(internal for internal, _ in panda_info.values()):
+          cloudlog.error("Internal panda is missing, trying again")
+          continue
+
+        # sort pandas to have a deterministic order; the C++ pandad assigns each
+        # panda a CAN bus offset based on argument order:
+        # * the internal one is always first
+        # * then by hardware type
+        # * as a last resort, by serial number
+        panda_serials = sorted(panda_serials, key=lambda s: (not panda_info[s][0], panda_info[s][1], s))
+
+        # run real pandad with all connected serials as arguments
         os.environ['MANAGER_DAEMON'] = 'pandad'
-        process = subprocess.Popen(["./pandad"], cwd=os.path.join(BASEDIR, "selfdrive/pandad"))
+        process = subprocess.Popen(["./pandad", *panda_serials], cwd=os.path.join(BASEDIR, "selfdrive/pandad"))
         process.wait()
     # TODO: wrap all panda exceptions in a base panda exception
     except (usb1.USBErrorNoDevice, usb1.USBErrorPipe):
