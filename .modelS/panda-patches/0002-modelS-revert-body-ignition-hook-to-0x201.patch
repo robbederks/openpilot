@@ -1,0 +1,32 @@
+From 56fc31fd77d0f6db6a7dc79a4a6e4cf79174ec09 Mon Sep 17 00:00:00 2001
+From: Robbe Derks <robbe.derks@gmail.com>
+Date: Sat, 18 Apr 2026 09:17:31 +0200
+Subject: [PATCH] modelS: revert body ignition hook to 0x201
+
+Upstream panda PR #2387 moved the body ignition hook from 0x201 to
+0x222. On Tesla Model S, 0x222 collides with a routine chassis
+broadcast, latching ignition_can spuriously. Model S ignition is
+already handled by the xnor-tech GTW_status (0x348) hook above, so
+restore the original body address.
+---
+ board/drivers/can_common.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/board/drivers/can_common.h b/board/drivers/can_common.h
+index 09712056..4ed6b580 100644
+--- a/board/drivers/can_common.h
++++ b/board/drivers/can_common.h
+@@ -223,8 +223,8 @@ void ignition_can_hook(CANPacket_t *msg) {
+     prev_counter_tesla_legacy = counter;
+   }
+ 
+-  // body v2 exception
+-  if (((msg->bus == 0U) || (msg->bus == 2U)) && (msg->addr == 0x222U)) {
++  // body exception
++  if (((msg->bus == 0U) || (msg->bus == 2U)) && (msg->addr == 0x201U)) {
+     ignition_can = true;
+     ignition_can_cnt = 0U;
+   }
+-- 
+2.43.0
+
