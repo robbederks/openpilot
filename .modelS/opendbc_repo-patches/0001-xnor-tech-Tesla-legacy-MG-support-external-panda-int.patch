@@ -1,7 +1,7 @@
-From a904539afbd0eece7bcaec60348e629615209cff Mon Sep 17 00:00:00 2001
+From 4d47b93ad81d8364641e19ac74054244066a7b14 Mon Sep 17 00:00:00 2001
 From: lukasloetkolben <61192133+lukasloetkolben@users.noreply.github.com>
 Date: Sat, 11 Apr 2026 11:43:54 +0200
-Subject: [PATCH 1/2] xnor-tech: Tesla legacy & MG support, external panda
+Subject: [PATCH] xnor-tech: Tesla legacy & MG support, external panda
  integration
 
 - Add MG car support (carcontroller, carstate, fingerprints, safety mode)
@@ -688,10 +688,10 @@ index 86308978..e361467d 100644
        Bus.party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.party),
        Bus.ap_party: CANParser(DBC[CP.carFingerprint][Bus.party], [], CANBUS.autopilot_party)
 diff --git a/opendbc/car/tesla/fingerprints.py b/opendbc/car/tesla/fingerprints.py
-index 9b33fd00..b2dabd6d 100644
+index 95e367b5..87e3e41d 100644
 --- a/opendbc/car/tesla/fingerprints.py
 +++ b/opendbc/car/tesla/fingerprints.py
-@@ -42,12 +42,55 @@ FW_VERSIONS = {
+@@ -45,12 +45,55 @@ FW_VERSIONS = {
        b'TeMYG4_Main_0.0.0 (78),Y4003.06.0',
        b'TeMYG4_SingleECU_0.0.0 (28),Y4S002.23.0',
        b'TeMYG4_SingleECU_0.0.0 (33),Y4S002.26',
@@ -1069,7 +1069,7 @@ index 00000000..3d905b77
 +    values["APS_eacMonitorChecksum"] = self.checksum(0x27d, data[:2])
 +    return self.packers[CANBUS.party].make_can_msg("APS_eacMonitor", CANBUS.party, values)
 diff --git a/opendbc/car/tesla/values.py b/opendbc/car/tesla/values.py
-index 873abfea..8ad15c3a 100644
+index fb018006..2738ccad 100644
 --- a/opendbc/car/tesla/values.py
 +++ b/opendbc/car/tesla/values.py
 @@ -62,6 +62,60 @@ class CAR(Platforms):
@@ -1154,7 +1154,7 @@ index 873abfea..8ad15c3a 100644
    ]
  )
  
-@@ -92,8 +158,14 @@ FSD_14_FW = {
+@@ -93,8 +159,14 @@ FSD_14_FW = {
  class CANBUS:
    party = 0
    vehicle = 1
@@ -1169,7 +1169,7 @@ index 873abfea..8ad15c3a 100644
  
  GEAR_MAP = {
    "DI_GEAR_INVALID": CarState.GearShifter.unknown,
-@@ -131,11 +203,20 @@ class CarControllerParams:
+@@ -132,11 +204,20 @@ class CarControllerParams:
    ACCEL_MIN = -3.48  # m/s^2
    JERK_LIMIT_MAX = 4.9  # m/s^3, ACC faults at 5.0
    JERK_LIMIT_MIN = -4.9  # m/s^3, ACC faults at 5.0
@@ -1190,7 +1190,7 @@ index 873abfea..8ad15c3a 100644
  
  
  class TeslaFlags(IntFlag):
-@@ -147,3 +228,5 @@ class TeslaFlags(IntFlag):
+@@ -148,3 +229,5 @@ class TeslaFlags(IntFlag):
  DBC = CAR.create_dbc_map()
  
  STEER_THRESHOLD = 1
@@ -1221,15 +1221,15 @@ index 2fe80c0f..84985718 100644
    # Segments that test specific issues
    # Controls mismatch due to standstill threshold
 diff --git a/opendbc/car/tests/test_fw_fingerprint.py b/opendbc/car/tests/test_fw_fingerprint.py
-index 811347bb..91ff9999 100644
+index a6aef90e..39723b6f 100644
 --- a/opendbc/car/tests/test_fw_fingerprint.py
 +++ b/opendbc/car/tests/test_fw_fingerprint.py
 @@ -262,7 +262,7 @@ class TestFwFingerprintTiming(unittest.TestCase):
          print(f'get_vin {name} case, query time={self.total_time / self.N} seconds')
  
    def test_fw_query_timing(self):
--    total_ref_time = 7.4
-+    total_ref_time = 7.5
+-    total_ref_time = 7.6
++    total_ref_time = 7.7
      brand_ref_times = {
        'gm': 1.0,
        'body': 0.1,
@@ -1238,7 +1238,7 @@ index 811347bb..91ff9999 100644
        'hyundai': 0.65,
        'mazda': 0.1,
 +      'mg': 0.1,
-       'nissan': 0.8,
+       'nissan': 1.0,
        'subaru': 0.65,
        'tesla': 0.1,
 diff --git a/opendbc/car/torque_data/override.toml b/opendbc/car/torque_data/override.toml
@@ -2231,7 +2231,7 @@ index 00000000..7668f9b7
 +  .fwd = tesla_legacy_fwd_hook,
 +};
 diff --git a/opendbc/safety/safety.h b/opendbc/safety/safety.h
-index 6417881d..ce4605cb 100644
+index a7c13354..fc98a28b 100644
 --- a/opendbc/safety/safety.h
 +++ b/opendbc/safety/safety.h
 @@ -11,12 +11,14 @@
@@ -2249,7 +2249,7 @@ index 6417881d..ce4605cb 100644
  #include "opendbc/safety/modes/subaru.h"
  #include "opendbc/safety/modes/subaru_preglobal.h"
  #include "opendbc/safety/modes/mazda.h"
-@@ -403,6 +405,8 @@ int set_safety_hooks(uint16_t mode, uint16_t param) {
+@@ -407,6 +409,8 @@ int set_safety_hooks(uint16_t mode, uint16_t param) {
      {SAFETY_FORD, &ford_hooks},
      {SAFETY_RIVIAN, &rivian_hooks},
      {SAFETY_TESLA, &tesla_hooks},
