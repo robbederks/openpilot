@@ -1,0 +1,44 @@
+From 68963bf9868164b2512152c7c71935af6e34db1f Mon Sep 17 00:00:00 2001
+From: lukasloetkolben <61192133+lukasloetkolben@users.noreply.github.com>
+Date: Sat, 11 Apr 2026 11:43:55 +0200
+Subject: [PATCH] xnor-tech: Tesla Model S legacy CAN ignition detection
+
+Add Tesla Model S (legacy, pre-Raven) ignition detection via GTW_status
+(0x348). Ignition tracks msg->data[0] bit 0, gated on the GTW rolling
+counter (data[6] low nibble) to reject bus noise.
+
+Upstream moved ignition_can_hook() from panda into
+opendbc/safety/ignition.h (#2396); the Model S legacy hook lives here
+now. VW MEB detection (also previously carried in the panda patch) is
+already upstream in this file, so it is no longer carried by the fork.
+---
+ opendbc/safety/ignition.h | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/opendbc/safety/ignition.h b/opendbc/safety/ignition.h
+index ae00c729..c8ff3fb6 100644
+--- a/opendbc/safety/ignition.h
++++ b/opendbc/safety/ignition.h
+@@ -68,6 +68,19 @@ void ignition_can_hook(const CANPacket_t *msg) {
+     }
+   }
+ 
++  // Tesla Model S (legacy) exception
++  if (((msg->bus == 0U) || (msg->bus == 1U)) && (msg->addr == 0x348U) && (GET_LEN(msg) == 8)) {
++    int counter = msg->data[6] & 0xFU;
++
++    static int prev_counter_tesla_legacy = -1;
++    if ((counter == ((prev_counter_tesla_legacy + 1) % 16)) && (prev_counter_tesla_legacy != -1)) {
++      // GTW_status
++      ignition_can = (msg->data[0] & 0x1U) != 0U;
++      ignition_can_cnt = 0U;
++    }
++    prev_counter_tesla_legacy = counter;
++  }
++
+   // TODO: this is too loose, Teslas have 0x222
+   // body v2 exception
+   // if (((msg->bus == 0U) || (msg->bus == 2U)) && (msg->addr == 0x222U)) {
+-- 
+2.43.0
+
