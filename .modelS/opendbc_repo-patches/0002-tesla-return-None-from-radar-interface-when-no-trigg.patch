@@ -1,7 +1,7 @@
-From 805f111a915a0fdc747f01f59b177a9eb918dfa2 Mon Sep 17 00:00:00 2001
+From 4e92522e2a09509e45db52c33fde2f62d8fc06b7 Mon Sep 17 00:00:00 2001
 From: Robbe Derks <robbe.derks@gmail.com>
 Date: Fri, 17 Apr 2026 12:36:38 +0200
-Subject: [PATCH 2/2] tesla: return None from radar interface when no trigger
+Subject: [PATCH 2/3] tesla: return None from radar interface when no trigger
 
 card.py only publishes liveTracks when update() returns a non-None
 RadarData. Returning an empty RadarData on every CAN tick caused
