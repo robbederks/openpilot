@@ -1,7 +1,7 @@
-From 68963bf9868164b2512152c7c71935af6e34db1f Mon Sep 17 00:00:00 2001
+From b74325307ea37d8930f3df865152c87e26decc67 Mon Sep 17 00:00:00 2001
 From: lukasloetkolben <61192133+lukasloetkolben@users.noreply.github.com>
 Date: Sat, 11 Apr 2026 11:43:55 +0200
-Subject: [PATCH] xnor-tech: Tesla Model S legacy CAN ignition detection
+Subject: [PATCH 3/3] xnor-tech: Tesla Model S legacy CAN ignition detection
 
 Add Tesla Model S (legacy, pre-Raven) ignition detection via GTW_status
 (0x348). Ignition tracks msg->data[0] bit 0, gated on the GTW rolling

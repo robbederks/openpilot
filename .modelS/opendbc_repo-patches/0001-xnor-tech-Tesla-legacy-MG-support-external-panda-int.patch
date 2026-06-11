@@ -1,7 +1,7 @@
-From 4d47b93ad81d8364641e19ac74054244066a7b14 Mon Sep 17 00:00:00 2001
+From fc829e09eee34a1a96d84f25567f9fa3500f14b9 Mon Sep 17 00:00:00 2001
 From: lukasloetkolben <61192133+lukasloetkolben@users.noreply.github.com>
 Date: Sat, 11 Apr 2026 11:43:54 +0200
-Subject: [PATCH] xnor-tech: Tesla legacy & MG support, external panda
+Subject: [PATCH 1/3] xnor-tech: Tesla legacy & MG support, external panda
  integration
 
 - Add MG car support (carcontroller, carstate, fingerprints, safety mode)
@@ -91,10 +91,10 @@ index 376b27c3..916714ec 100644
  def rate_limit(new_value, last_value, dw_step, up_step):
    return float(np.clip(new_value, last_value + dw_step, last_value + up_step))
 diff --git a/opendbc/car/car.capnp b/opendbc/car/car.capnp
-index d2b8d758..794db40c 100644
+index 0a626df1..a173c968 100644
 --- a/opendbc/car/car.capnp
 +++ b/opendbc/car/car.capnp
-@@ -635,6 +635,8 @@ struct CarParams {
+@@ -636,6 +636,8 @@ struct CarParams {
      fcaGiorgio @32;
      rivian @33;
      volkswagenMeb @34;
@@ -524,7 +524,7 @@ index 8b7d9989..b4d0489c 100644
      # TODO: HUD control
      new_actuators = actuators.as_builder()
 diff --git a/opendbc/car/tesla/carstate.py b/opendbc/car/tesla/carstate.py
-index 86308978..e361467d 100644
+index cc98ad4f..d4f5d6f4 100644
 --- a/opendbc/car/tesla/carstate.py
 +++ b/opendbc/car/tesla/carstate.py
 @@ -5,7 +5,7 @@ from opendbc.car.carlog import carlog
@@ -574,7 +574,7 @@ index 86308978..e361467d 100644
      cp_party = can_parsers[Bus.party]
      cp_ap_party = can_parsers[Bus.ap_party]
      ret = structs.CarState()
-@@ -140,8 +162,112 @@ class CarState(CarStateBase):
+@@ -139,8 +161,112 @@ class CarState(CarStateBase):
  
      return ret
  
@@ -1069,7 +1069,7 @@ index 00000000..3d905b77
 +    values["APS_eacMonitorChecksum"] = self.checksum(0x27d, data[:2])
 +    return self.packers[CANBUS.party].make_can_msg("APS_eacMonitor", CANBUS.party, values)
 diff --git a/opendbc/car/tesla/values.py b/opendbc/car/tesla/values.py
-index fb018006..2738ccad 100644
+index 0acd3912..f9a9107f 100644
 --- a/opendbc/car/tesla/values.py
 +++ b/opendbc/car/tesla/values.py
 @@ -62,6 +62,60 @@ class CAR(Platforms):
@@ -1169,7 +1169,7 @@ index fb018006..2738ccad 100644
  
  GEAR_MAP = {
    "DI_GEAR_INVALID": CarState.GearShifter.unknown,
-@@ -132,11 +204,20 @@ class CarControllerParams:
+@@ -119,11 +191,20 @@ class CarControllerParams:
    ACCEL_MIN = -3.48  # m/s^2
    JERK_LIMIT_MAX = 4.9  # m/s^3, ACC faults at 5.0
    JERK_LIMIT_MIN = -4.9  # m/s^3, ACC faults at 5.0
@@ -1190,14 +1190,14 @@ index fb018006..2738ccad 100644
  
  
  class TeslaFlags(IntFlag):
-@@ -148,3 +229,5 @@ class TeslaFlags(IntFlag):
+@@ -135,3 +216,5 @@ class TeslaFlags(IntFlag):
  DBC = CAR.create_dbc_map()
  
  STEER_THRESHOLD = 1
 +
 +LEGACY_CARS = (CAR.TESLA_MODEL_S_HW1, CAR.TESLA_MODEL_S_HW2, CAR.TESLA_MODEL_S_HW3, CAR.TESLA_MODEL_X_HW1, CAR.TESLA_MODEL_X_HW2)
 diff --git a/opendbc/car/tests/routes.py b/opendbc/car/tests/routes.py
-index 2fe80c0f..84985718 100644
+index 17ac6e17..4d277cfe 100644
 --- a/opendbc/car/tests/routes.py
 +++ b/opendbc/car/tests/routes.py
 @@ -16,6 +16,7 @@ from opendbc.car.values import Platform
@@ -1208,7 +1208,7 @@ index 2fe80c0f..84985718 100644
  
  # FIXME: add routes for these cars
  non_tested_cars = [
-@@ -348,6 +349,11 @@ routes = [
+@@ -350,6 +351,11 @@ routes = [
    CarTestRoute("c8a98e58647765ad/00000002--84e4746136", TESLA.TESLA_MODEL_Y),
    CarTestRoute("2c912ca5de3b1ee9/0000025d--6eb6bcbca4", TESLA.TESLA_MODEL_Y, segment=4),
    CarTestRoute("bdda168c0c35fad7/00000001--5c5a36ec06", TESLA.TESLA_MODEL_X), # openpilot longitudinal
@@ -1221,15 +1221,15 @@ index 2fe80c0f..84985718 100644
    # Segments that test specific issues
    # Controls mismatch due to standstill threshold
 diff --git a/opendbc/car/tests/test_fw_fingerprint.py b/opendbc/car/tests/test_fw_fingerprint.py
-index a6aef90e..39723b6f 100644
+index 42dedad8..49cde948 100644
 --- a/opendbc/car/tests/test_fw_fingerprint.py
 +++ b/opendbc/car/tests/test_fw_fingerprint.py
 @@ -262,7 +262,7 @@ class TestFwFingerprintTiming(unittest.TestCase):
          print(f'get_vin {name} case, query time={self.total_time / self.N} seconds')
  
    def test_fw_query_timing(self):
--    total_ref_time = 7.6
-+    total_ref_time = 7.7
+-    total_ref_time = 8.2
++    total_ref_time = 8.3
      brand_ref_times = {
        'gm': 1.0,
        'body': 0.1,
@@ -1238,11 +1238,11 @@ index a6aef90e..39723b6f 100644
        'hyundai': 0.65,
        'mazda': 0.1,
 +      'mg': 0.1,
-       'nissan': 1.0,
+       'nissan': 1.6,
        'subaru': 0.65,
        'tesla': 0.1,
 diff --git a/opendbc/car/torque_data/override.toml b/opendbc/car/torque_data/override.toml
-index f6bab760..51bfb97d 100644
+index 7e025d93..39cf7416 100644
 --- a/opendbc/car/torque_data/override.toml
 +++ b/opendbc/car/torque_data/override.toml
 @@ -22,6 +22,12 @@ legend = ["LAT_ACCEL_FACTOR", "MAX_LAT_ACCEL_MEASURED", "FRICTION"]
@@ -1257,8 +1257,8 @@ index f6bab760..51bfb97d 100644
 +"TESLA_MODEL_S_HW3" = [nan, 2.5, nan]
  
  # Guess
- "FORD_BRONCO_SPORT_MK1" = [nan, 1.5, nan]
-@@ -76,6 +82,8 @@ legend = ["LAT_ACCEL_FACTOR", "MAX_LAT_ACCEL_MEASURED", "FRICTION"]
+ "VOLKSWAGEN_ID4_MK1" = [nan, 2.5, nan]
+@@ -78,6 +84,8 @@ legend = ["LAT_ACCEL_FACTOR", "MAX_LAT_ACCEL_MEASURED", "FRICTION"]
  "KIA_K8_HEV_1ST_GEN" = [2.5, 2.5, 0.1]
  "HYUNDAI_CUSTIN_1ST_GEN" = [2.5, 2.5, 0.1]
  "LEXUS_GS_F" = [2.5, 2.5, 0.08]
@@ -1817,7 +1817,7 @@ index 00000000..40ac48cc
 +VAL_ 1160 DAS_steeringControlType 3 "EMERGENCY_LANE_KEEP" 2 "LANE_KEEP_ASSIST" 1 "ANGLE_CONTROL" 0 "NONE" ;
 \ No newline at end of file
 diff --git a/opendbc/safety/declarations.h b/opendbc/safety/declarations.h
-index 1a685494..dfaae8af 100644
+index d2b72a99..d4adfd64 100644
 --- a/opendbc/safety/declarations.h
 +++ b/opendbc/safety/declarations.h
 @@ -34,6 +34,8 @@
@@ -2231,7 +2231,7 @@ index 00000000..7668f9b7
 +  .fwd = tesla_legacy_fwd_hook,
 +};
 diff --git a/opendbc/safety/safety.h b/opendbc/safety/safety.h
-index a7c13354..fc98a28b 100644
+index 77f6c345..10a0c4db 100644
 --- a/opendbc/safety/safety.h
 +++ b/opendbc/safety/safety.h
 @@ -11,12 +11,14 @@
@@ -2249,7 +2249,7 @@ index a7c13354..fc98a28b 100644
  #include "opendbc/safety/modes/subaru.h"
  #include "opendbc/safety/modes/subaru_preglobal.h"
  #include "opendbc/safety/modes/mazda.h"
-@@ -407,6 +409,8 @@ int set_safety_hooks(uint16_t mode, uint16_t param) {
+@@ -413,6 +415,8 @@ int set_safety_hooks(uint16_t mode, uint16_t param) {
      {SAFETY_FORD, &ford_hooks},
      {SAFETY_RIVIAN, &rivian_hooks},
      {SAFETY_TESLA, &tesla_hooks},
