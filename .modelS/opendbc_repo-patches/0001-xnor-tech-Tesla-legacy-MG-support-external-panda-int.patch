@@ -1,4 +1,4 @@
-From fc829e09eee34a1a96d84f25567f9fa3500f14b9 Mon Sep 17 00:00:00 2001
+From 97b215f76d38a9bd72d4d3e70fd012e6e1bb1ddf Mon Sep 17 00:00:00 2001
 From: lukasloetkolben <61192133+lukasloetkolben@users.noreply.github.com>
 Date: Sat, 11 Apr 2026 11:43:54 +0200
 Subject: [PATCH 1/3] xnor-tech: Tesla legacy & MG support, external panda
@@ -17,13 +17,13 @@ Subject: [PATCH 1/3] xnor-tech: Tesla legacy & MG support, external panda
  opendbc/car/docs_definitions.py               |   5 +
  opendbc/car/mg/__init__.py                    |   0
  opendbc/car/mg/carcontroller.py               |  38 ++
- opendbc/car/mg/carstate.py                    |  79 ++++
+ opendbc/car/mg/carstate.py                    |  78 ++++
  opendbc/car/mg/fingerprints.py                |  29 ++
  opendbc/car/mg/interface.py                   |  36 ++
  opendbc/car/mg/mgcan.py                       |  29 ++
  opendbc/car/mg/values.py                      |  80 ++++
  opendbc/car/tesla/carcontroller.py            |  29 +-
- opendbc/car/tesla/carstate.py                 | 130 +++++-
+ opendbc/car/tesla/carstate.py                 | 129 +++++-
  opendbc/car/tesla/fingerprints.py             |  43 ++
  opendbc/car/tesla/interface.py                |  49 ++-
  opendbc/car/tesla/radar_interface.py          |  70 +++-
@@ -45,7 +45,7 @@ Subject: [PATCH 1/3] xnor-tech: Tesla legacy & MG support, external panda
  opendbc/safety/tests/test_mg.py               |  68 +++
  opendbc/safety/tests/test_tesla_hw1.py        | 312 ++++++++++++++
  opendbc/safety/tests/test_tesla_hw23.py       | 391 ++++++++++++++++++
- 34 files changed, 2413 insertions(+), 38 deletions(-)
+ 34 files changed, 2411 insertions(+), 38 deletions(-)
  create mode 100644 opendbc/car/mg/__init__.py
  create mode 100644 opendbc/car/mg/carcontroller.py
  create mode 100644 opendbc/car/mg/carstate.py
@@ -175,10 +175,10 @@ index 00000000..30512519
 +    return new_actuators, can_sends
 diff --git a/opendbc/car/mg/carstate.py b/opendbc/car/mg/carstate.py
 new file mode 100644
-index 00000000..52692555
+index 00000000..51d3da49
 --- /dev/null
 +++ b/opendbc/car/mg/carstate.py
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,78 @@
 +from opendbc.can.parser import CANParser
 +from opendbc.car import Bus, structs
 +from opendbc.car.interfaces import CarStateBase
@@ -206,7 +206,6 @@ index 00000000..52692555
 +    ret.gasPressed = cp.vl["GW_HSC2_HCU_FrP00"]["EPTAccelActuPosHSC2"] > 0
 +
 +    # Brake pedal
-+    ret.brake = 0
 +    if self.CP.carFingerprint == CAR.MG_ZS_EV:
 +      ret.brakePressed = cp.vl["GW_HSC2_HCU_FrP00"]["EPTBrkPdlDscrtInptStsHSC2"] == 1
 +    else:
@@ -524,7 +523,7 @@ index 8b7d9989..b4d0489c 100644
      # TODO: HUD control
      new_actuators = actuators.as_builder()
 diff --git a/opendbc/car/tesla/carstate.py b/opendbc/car/tesla/carstate.py
-index cc98ad4f..d4f5d6f4 100644
+index cc98ad4f..40c5be33 100644
 --- a/opendbc/car/tesla/carstate.py
 +++ b/opendbc/car/tesla/carstate.py
 @@ -5,7 +5,7 @@ from opendbc.car.carlog import carlog
@@ -574,7 +573,7 @@ index cc98ad4f..d4f5d6f4 100644
      cp_party = can_parsers[Bus.party]
      cp_ap_party = can_parsers[Bus.ap_party]
      ret = structs.CarState()
-@@ -139,8 +161,112 @@ class CarState(CarStateBase):
+@@ -139,8 +161,111 @@ class CarState(CarStateBase):
  
      return ret
  
@@ -594,7 +593,6 @@ index cc98ad4f..d4f5d6f4 100644
 +    ret.gasPressed = cp_pt.vl["DI_torque1"]["DI_pedalPos"] > 0
 +
 +    # Brake pedal
-+    ret.brake = 0
 +    ret.brakePressed = cp_chassis.vl["BrakeMessage"]["driverBrakeStatus"] == 2
 +
 +    # Steering wheel
