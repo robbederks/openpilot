@@ -1,0 +1,5 @@
+upstream_repo: https://github.com/commaai/openpilot
+
+tracked:
+  - upstream: master
+    slug: master
