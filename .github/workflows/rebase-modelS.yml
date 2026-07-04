@@ -58,3 +58,31 @@ jobs:
           UPSTREAM_REF:  ${{ matrix.upstream }}
           OUTPUT_SLUG:   ${{ matrix.slug }}
         run: bash .modelS/scripts/rebase.sh
+
+  test:
+    needs: [plan, rebase]
+    if: ${{ needs.rebase.result == 'success' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: modelS-${{ matrix.slug }}
+          submodules: true
+      - name: Getting LFS files
+        uses: nick-fields/retry@7152eba30c6575329ac0576536151aca5a72780e
+        with:
+          timeout_minutes: 2
+          max_attempts: 3
+          command: git lfs pull
+      - run: openpilot/tools/op.sh setup
+      - name: Build openpilot
+        timeout-minutes: 30
+        run: scons
+      - name: Run pandad smoke test
+        timeout-minutes: 5
+        run: pytest -s openpilot/selfdrive/pandad/tests/test_pandad_smoke.py
