@@ -1,0 +1,125 @@
+From 079a34b31aeec869439829167fef3bd63a71add7 Mon Sep 17 00:00:00 2001
+From: Robbe Derks <robbe.derks@gmail.com>
+Date: Tue, 18 Aug 2026 14:30:03 +0200
+Subject: [PATCH] python: restore old H7 bootstub type fallback
+
+---
+ python/__init__.py         | 22 +++++++++++++++++++---
+ python/usb.py              |  3 ++-
+ tests/test_old_bootstub.py | 36 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 57 insertions(+), 4 deletions(-)
+ create mode 100644 tests/test_old_bootstub.py
+
+diff --git a/python/__init__.py b/python/__init__.py
+index 93449614..2d730fde 100644
+--- a/python/__init__.py
++++ b/python/__init__.py
+@@ -270,7 +270,7 @@ class Panda:
+ 
+   @classmethod
+   def usb_connect(cls, serial, claim=True, no_error=False):
+-    handle, usb_serial, bootstub = None, None, None
++    handle, usb_serial, bootstub, bcd_hw_type = None, None, None, None
+     context = usb1.USBContext()
+     context.open()
+     try:
+@@ -296,13 +296,19 @@ class Panda:
+               handle.claimInterface(0)
+               # handle.setInterfaceAltSetting(0, 0)  # Issue in USB stack
+ 
++            # Older bootstubs expose the hardware type only through bcdDevice.
++            # 0x2300 is the constant used before bcdDevice encoded the type.
++            this_bcd = device.getbcdDevice()
++            if this_bcd is not None and this_bcd != 0x2300:
++              bcd_hw_type = bytes([this_bcd >> 8])
++
+             break
+     except Exception:
+       logger.exception("USB connect error")
+ 
+     usb_handle = None
+     if handle is not None:
+-      usb_handle = PandaUsbHandle(handle)
++      usb_handle = PandaUsbHandle(handle, bcd_hw_type)
+     else:
+       context.close()
+ 
+@@ -606,7 +612,17 @@ class Panda:
+     return bytes(part_1 + part_2)
+ 
+   def get_type(self):
+-    return self._handle.controlRead(Panda.REQUEST_IN, 0xc1, 0, 0, 0x40)
++    ret = self._handle.controlRead(Panda.REQUEST_IN, 0xc1, 0, 0, 0x40)
++
++    # Older H7 bootstubs do not implement this endpoint and return the generic
++    # soft-flasher header instead. All H7 bootstubs expose their type through
++    # bcdDevice, so use it only when it identifies a device we still support.
++    missing_hw_type_endpoint = self.bootstub and ret is not None and ret.startswith(b'\xff\x00\xc1\x3e\xde\xad\xd0\x0d')
++    if missing_hw_type_endpoint and isinstance(self._handle, PandaUsbHandle):
++      if self._handle.bcd_hw_type in self.SUPPORTED_DEVICES:
++        ret = self._handle.bcd_hw_type
++
++    return ret
+ 
+   def get_packets_versions(self):
+     dat = self._handle.controlRead(Panda.REQUEST_IN, 0xdd, 0, 0, 8)
+diff --git a/python/usb.py b/python/usb.py
+index 0a012896..99a1a3f9 100644
+--- a/python/usb.py
++++ b/python/usb.py
+@@ -4,8 +4,9 @@ from .base import BaseHandle, BaseSTBootloaderHandle, TIMEOUT
+ from .constants import McuType
+ 
+ class PandaUsbHandle(BaseHandle):
+-  def __init__(self, libusb_handle):
++  def __init__(self, libusb_handle, bcd_hw_type: bytes | None = None):
+     self._libusb_handle = libusb_handle
++    self.bcd_hw_type = bcd_hw_type
+ 
+   def close(self):
+     self._libusb_handle.close()
+diff --git a/tests/test_old_bootstub.py b/tests/test_old_bootstub.py
+new file mode 100644
+index 00000000..495981c9
+--- /dev/null
++++ b/tests/test_old_bootstub.py
+@@ -0,0 +1,36 @@
++from panda import Panda
++from panda.python.usb import PandaUsbHandle
++
++
++class FakeUsbHandle:
++  def __init__(self, response: bytes):
++    self.response = response
++
++  def controlRead(self, *args):
++    return self.response
++
++
++def get_type(response: bytes, bcd_hw_type: bytes | None, bootstub: bool = True):
++  panda = Panda.__new__(Panda)
++  panda._handle = PandaUsbHandle(FakeUsbHandle(response), bcd_hw_type)
++  panda.bootstub = bootstub
++  return panda.get_type()
++
++
++def test_old_h7_bootstub_uses_usb_descriptor_type():
++  old_bootstub_response = bytes.fromhex("ff00c13edeadd00d80ea0208")
++  assert get_type(old_bootstub_response, Panda.HW_TYPE_RED_PANDA) == Panda.HW_TYPE_RED_PANDA
++
++
++def test_old_bootstub_does_not_restore_unsupported_hardware():
++  old_bootstub_response = bytes.fromhex("ff00c13edeadd00d80ea0208")
++  assert get_type(old_bootstub_response, b'\x03') == old_bootstub_response
++
++
++def test_hardware_type_endpoint_takes_precedence():
++  assert get_type(Panda.HW_TYPE_TRES, Panda.HW_TYPE_RED_PANDA) == Panda.HW_TYPE_TRES
++
++
++def test_application_response_does_not_use_bootstub_fallback():
++  response = bytes.fromhex("ff00c13edeadd00d80ea0208")
++  assert get_type(response, Panda.HW_TYPE_RED_PANDA, bootstub=False) == response
+-- 
+2.43.0
+
