@@ -1,4 +1,4 @@
-From 37fc71ea137d0b1eb768b268a02f31c01a283055 Mon Sep 17 00:00:00 2001
+From bff01dad73e3b905db8902d9657a301b188d7c9a Mon Sep 17 00:00:00 2001
 From: Robbe Derks <robbe.derks@gmail.com>
 Date: Fri, 17 Apr 2026 12:36:38 +0200
 Subject: [PATCH 2/3] tesla: return None from radar interface when no trigger
