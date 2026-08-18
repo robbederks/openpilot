@@ -1,4 +1,4 @@
-From 45610d33f66cfd6ebe4b9b1af1e85b9f7c68e05d Mon Sep 17 00:00:00 2001
+From 105833e93771df214aaa16a2eabc322a4049b47c Mon Sep 17 00:00:00 2001
 From: lukasloetkolben <61192133+lukasloetkolben@users.noreply.github.com>
 Date: Sat, 11 Apr 2026 11:43:55 +0200
 Subject: [PATCH 3/3] xnor-tech: Tesla Model S legacy CAN ignition detection
