@@ -1,4 +1,4 @@
-From 570a84d642b936643f57b6322641937a6fdae0b6 Mon Sep 17 00:00:00 2001
+From e17c98a7a6528f2657e5769a94dea1005f40bede Mon Sep 17 00:00:00 2001
 From: lukasloetkolben <61192133+lukasloetkolben@users.noreply.github.com>
 Date: Sat, 11 Apr 2026 11:43:54 +0200
 Subject: [PATCH 1/3] xnor-tech: Tesla legacy & MG support, external panda
@@ -20,14 +20,14 @@ Subject: [PATCH 1/3] xnor-tech: Tesla legacy & MG support, external panda
  opendbc/car/mg/interface.py                   |  12 +-
  opendbc/car/mg/mgcan.py                       |   3 +-
  opendbc/car/mg/values.py                      |  50 ++-
- opendbc/car/tesla/carcontroller.py            |  29 +-
+ opendbc/car/tesla/carcontroller.py            |  25 +-
  opendbc/car/tesla/carstate.py                 | 129 +++++-
  opendbc/car/tesla/fingerprints.py             |  43 ++
  opendbc/car/tesla/interface.py                |  44 +-
  opendbc/car/tesla/radar_interface.py          |  70 +++-
- opendbc/car/tesla/teslacan.py                 |  23 +-
- opendbc/car/tesla/teslacan_legacy.py          |  65 +++
- opendbc/car/tesla/values.py                   |  89 +++-
+ opendbc/car/tesla/teslacan.py                 |   2 +-
+ opendbc/car/tesla/teslacan_legacy.py          |  53 +++
+ opendbc/car/tesla/values.py                   |  88 +++-
  opendbc/car/tests/routes.py                   |   5 +
  opendbc/car/tests/test_fw_fingerprint.py      |   6 +-
  opendbc/car/torque_data/override.toml         |   7 +
@@ -42,7 +42,7 @@ Subject: [PATCH 1/3] xnor-tech: Tesla legacy & MG support, external panda
  opendbc/safety/tests/test_mg.py               |  49 +--
  opendbc/safety/tests/test_tesla_hw1.py        | 312 ++++++++++++++
  opendbc/safety/tests/test_tesla_hw23.py       | 391 ++++++++++++++++++
- 31 files changed, 1760 insertions(+), 162 deletions(-)
+ 31 files changed, 1728 insertions(+), 156 deletions(-)
  create mode 100644 opendbc/car/tesla/teslacan_legacy.py
  create mode 100644 opendbc/dbc/tesla_raven_party.dbc
  create mode 100644 opendbc/safety/modes/tesla_legacy.h
@@ -377,7 +377,7 @@ index 6c606a40..220a283e 100644
 +
  DBC = CAR.create_dbc_map()
 diff --git a/opendbc/car/tesla/carcontroller.py b/opendbc/car/tesla/carcontroller.py
-index 8b7d9989..b4d0489c 100644
+index 8b7d9989..e974099e 100644
 --- a/opendbc/car/tesla/carcontroller.py
 +++ b/opendbc/car/tesla/carcontroller.py
 @@ -4,7 +4,8 @@ from opendbc.car import Bus
@@ -427,22 +427,6 @@ index 8b7d9989..b4d0489c 100644
  
      # Longitudinal control
      if self.CP.openpilotLongitudinalControl:
-@@ -50,13 +65,13 @@ class CarController(CarControllerBase):
-         state = 13 if CC.cruiseControl.cancel else 4  # 4=ACC_ON, 13=ACC_CANCEL_GENERIC_SILENT
-         accel = float(np.clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX))
-         cntr = (self.frame // 4) % 8
--        can_sends.append(self.tesla_can.create_longitudinal_command(state, accel, cntr, CS.out.vEgo, CC.longActive))
-+        can_sends.append(self.tesla_can.create_longitudinal_command(state, accel, cntr, CS.out.vEgo, CC.longActive, CS.out.gasPressed))
- 
-     else:
-       # Increment counter so cancel is prioritized even without openpilot longitudinal
-       if CC.cruiseControl.cancel:
-         cntr = (CS.das_control["DAS_controlCounter"] + 1) % 8
--        can_sends.append(self.tesla_can.create_longitudinal_command(13, 0, cntr, CS.out.vEgo, False))
-+        can_sends.append(self.tesla_can.create_longitudinal_command(13, 0, cntr, CS.out.vEgo, False, CS.out.gasPressed))
- 
-     # TODO: HUD control
-     new_actuators = actuators.as_builder()
 diff --git a/opendbc/car/tesla/carstate.py b/opendbc/car/tesla/carstate.py
 index 4dc283a5..eb44677e 100644
 --- a/opendbc/car/tesla/carstate.py
@@ -854,50 +838,10 @@ index c1072dbe..059430c3 100644
          self.pts[i] = structs.RadarData.RadarPoint()
          self.pts[i].trackId = self.track_id
 diff --git a/opendbc/car/tesla/teslacan.py b/opendbc/car/tesla/teslacan.py
-index 902cc31b..2d6787dc 100644
+index 902cc31b..c30898ab 100644
 --- a/opendbc/car/tesla/teslacan.py
 +++ b/opendbc/car/tesla/teslacan.py
-@@ -13,7 +13,10 @@ def get_steer_ctrl_type(flags: int, ctrl_type: int) -> int:
- class TeslaCAN:
-   def __init__(self, CP, packer):
-     self.CP = CP
-+    self.CCP = CarControllerParams
-     self.packer = packer
-+    self.jerk_upper = self.CCP.JERK_LIMIT_MAX
-+    self.jerk_lower = self.CCP.JERK_LIMIT_MIN
- 
-   def create_steering_control(self, angle, enabled):
-     # On FSD 14+, ANGLE_CONTROL behavior changed to allow user winddown while actuating.
-@@ -28,22 +31,32 @@ class TeslaCAN:
- 
-     return self.packer.make_can_msg("DAS_steeringControl", CANBUS.party, values)
- 
--  def create_longitudinal_command(self, acc_state, accel, counter, v_ego, active):
--    set_speed = min(max(v_ego + accel, 0) * CV.MS_TO_KPH, 400)
-+  def create_longitudinal_command(self, acc_state, accel, counter, v_ego, active, gas_pressed):
-+    from opendbc.car.interfaces import V_CRUISE_MAX
-+
-+    set_speed = max(v_ego * CV.MS_TO_KPH, 0)
-+    if active:
-+      set_speed = 0 if accel < 0 else V_CRUISE_MAX
-+
-+    if gas_pressed:
-+      self.jerk_upper = self.jerk_lower = 0.0
-+    else:
-+      self.jerk_lower = max(self.jerk_lower - self.CCP.JERK_RAMP_RATE, self.CCP.JERK_LIMIT_MIN)
-+      self.jerk_upper = min(self.jerk_upper + self.CCP.JERK_RAMP_RATE, self.CCP.JERK_LIMIT_MAX)
- 
-     values = {
-       "DAS_setSpeed": set_speed,
-       "DAS_accState": acc_state,
-       "DAS_aebEvent": 0,
--      "DAS_jerkMin": CarControllerParams.JERK_LIMIT_MIN,
--      "DAS_jerkMax": CarControllerParams.JERK_LIMIT_MAX,
-+      "DAS_jerkMin": self.jerk_lower,
-+      "DAS_jerkMax": self.jerk_upper,
-       "DAS_accelMin": accel,
-       "DAS_accelMax": max(accel, 0),
-       "DAS_controlCounter": counter,
+@@ -43,7 +43,7 @@ class TeslaCAN:
      }
      return self.packer.make_can_msg("DAS_control", CANBUS.party, values)
  
@@ -908,21 +852,17 @@ index 902cc31b..2d6787dc 100644
      }
 diff --git a/opendbc/car/tesla/teslacan_legacy.py b/opendbc/car/tesla/teslacan_legacy.py
 new file mode 100644
-index 00000000..3d905b77
+index 00000000..6a48296f
 --- /dev/null
 +++ b/opendbc/car/tesla/teslacan_legacy.py
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,53 @@
 +from opendbc.car.common.conversions import Conversions as CV
-+from opendbc.car.interfaces import V_CRUISE_MAX
 +from opendbc.car.tesla.values import CANBUS, CarControllerParams
 +
 +
 +class TeslaCANRaven:
 +  def __init__(self, packers):
 +    self.packers = packers
-+    self.CCP = CarControllerParams
-+    self.jerk_upper = self.CCP.JERK_LIMIT_MAX
-+    self.jerk_lower = self.CCP.JERK_LIMIT_MIN
 +
 +  @staticmethod
 +  def checksum(msg_id, dat):
@@ -942,23 +882,15 @@ index 00000000..3d905b77
 +    values["DAS_steeringControlChecksum"] = self.checksum(0x488, data[:3])
 +    return self.packers[CANBUS.party].make_can_msg("DAS_steeringControl", CANBUS.party, values)
 +
-+  def create_longitudinal_command(self, acc_state, accel, counter, v_ego, active, gas_pressed):
-+    set_speed = max(v_ego * CV.MS_TO_KPH, 0)
-+    if active:
-+      set_speed = 0 if accel < 0 else V_CRUISE_MAX
-+
-+    if gas_pressed:
-+      self.jerk_upper = self.jerk_lower = 0.0
-+    else:
-+      self.jerk_lower = max(self.jerk_lower - self.CCP.JERK_RAMP_RATE, self.CCP.JERK_LIMIT_MIN)
-+      self.jerk_upper = min(self.jerk_upper + self.CCP.JERK_RAMP_RATE, self.CCP.JERK_LIMIT_MAX)
++  def create_longitudinal_command(self, acc_state, accel, counter, v_ego, active):
++    set_speed = min(max(v_ego + accel, 0) * CV.MS_TO_KPH, 400)
 +
 +    values = {
 +      "DAS_setSpeed": set_speed,
 +      "DAS_accState": acc_state,
 +      "DAS_aebEvent": 0,
-+      "DAS_jerkMin": self.jerk_lower,
-+      "DAS_jerkMax": self.jerk_upper,
++      "DAS_jerkMin": CarControllerParams.JERK_LIMIT_MIN,
++      "DAS_jerkMax": CarControllerParams.JERK_LIMIT_MAX,
 +      "DAS_accelMin": accel,
 +      "DAS_accelMax": max(accel, 0),
 +      "DAS_controlCounter": counter,
@@ -978,7 +910,7 @@ index 00000000..3d905b77
 +    values["APS_eacMonitorChecksum"] = self.checksum(0x27d, data[:2])
 +    return self.packers[CANBUS.party].make_can_msg("APS_eacMonitor", CANBUS.party, values)
 diff --git a/opendbc/car/tesla/values.py b/opendbc/car/tesla/values.py
-index cceac33b..c64f7ff5 100644
+index cceac33b..eece6749 100644
 --- a/opendbc/car/tesla/values.py
 +++ b/opendbc/car/tesla/values.py
 @@ -62,16 +62,84 @@ class CAR(Platforms):
@@ -1083,17 +1015,14 @@ index cceac33b..c64f7ff5 100644
  
  GEAR_MAP = {
    "DI_GEAR_INVALID": CarState.GearShifter.unknown,
-@@ -120,11 +194,20 @@ class CarControllerParams:
-   ACCEL_MIN = -3.48  # m/s^2
-   JERK_LIMIT_MAX = 4.9  # m/s^3, ACC faults at 5.0
+@@ -122,9 +196,17 @@ class CarControllerParams:
    JERK_LIMIT_MIN = -4.9  # m/s^3, ACC faults at 5.0
-+  JERK_RAMP_RATE = JERK_LIMIT_MAX * 0.002  # m/s^3 per control step, for smooth gas override
-+
-+
+ 
+ 
 +class TeslaLegacyParams(IntFlag):
 +  NO_SDM1 = 1
- 
- 
++
++
  class TeslaSafetyFlags(IntFlag):
    LONG_CONTROL = 1
    FSD_14 = 2
@@ -1104,7 +1033,7 @@ index cceac33b..c64f7ff5 100644
  
  
  class TeslaFlags(IntFlag):
-@@ -136,3 +219,5 @@ class TeslaFlags(IntFlag):
+@@ -136,3 +218,5 @@ class TeslaFlags(IntFlag):
  DBC = CAR.create_dbc_map()
  
  STEER_THRESHOLD = 1
@@ -2694,4 +2623,3 @@ index 00000000..c1df2fbe
 +  unittest.main()
 -- 
 2.43.0
-
